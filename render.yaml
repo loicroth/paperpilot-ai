@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: paperpilot-ai
+    runtime: python
+    region: frankfurt
+    plan: 0.5c-512mb
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.run
+    autoDeployTrigger: 'off'
+    healthCheckPath: /healthz
+    disk:
+      name: paperpilot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /var/data
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
