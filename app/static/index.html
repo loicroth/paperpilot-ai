@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>PaperPilot AI — Simulation Spot</title>
+<link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar">
+<a class="brand" href="#overview" aria-label="PaperPilot accueil"><span class="brand-icon">P<span>↗</span></span><span>PaperPilot <small>AI TRADING LAB</small></span></a>
+<div class="mode-label"><i></i> PAPER TRADING <span>V1</span></div>
+<nav aria-label="Navigation principale"><button class="nav active" data-view="overview"><span>◈</span> Vue d’ensemble</button><button class="nav" data-view="history"><span>≡</span> Trades & décisions</button><button class="nav" data-view="settings"><span>⚙</span> Paramètres</button></nav>
+<div class="sidebar-bottom"><span class="shield">◇</span><strong>Capital 100 % virtuel</strong><p>Spot · Aucun levier<br>Aucun accès privé Binance</p><div class="lock">MODE RÉEL VERROUILLÉ</div></div>
+</aside>
+<main>
+<header><div><div class="eyebrow">VOTRE LABORATOIRE DE TRADING</div><h1 id="pageTitle">Vue d’ensemble</h1><p class="subheading">Observer le marché. Décider avec méthode.</p></div><div class="header-right"><span class="timezone">Horaires affichés en heure locale</span><div class="connection"><span id="connectionDot" class="dot muted"></span><span id="connectionText">Connexion au serveur…</span></div></div></header>
+<div id="requestError" class="notice error hidden" role="alert"></div>
+<section id="configurationNotice" class="notice config hidden"><span class="notice-symbol">⚙</span><div><strong>IA non configurée</strong><p>Ajoutez votre clé OpenAI dans le fichier <code>.env</code> côté serveur, puis relancez l’application. Aucun trade ne sera inventé.</p></div><button class="button subtle" data-go="settings">Voir la configuration</button></section>
+<section class="robot-bar"><div class="robot-status"><span id="robotDot" class="dot muted"></span><div><strong id="robotStatus" role="status" aria-live="polite">Chargement…</strong><p id="robotMessage">Récupération de l’état du portefeuille.</p></div></div><div class="controls"><button id="startButton" class="button primary">▶ Démarrer</button><button id="pauseButton" class="button">Ⅱ Pause entrées</button><button id="stopButton" class="button subtle">Arrêter les analyses</button></div></section>
+<section data-page="overview">
+<div class="metrics">
+<article class="metric featured"><span>Capital actuel</span><strong id="equity">—</strong><div><span id="pnlBadge" class="badge neutral">—</span><small>depuis le début</small></div></article>
+<article class="metric"><span>Capital initial</span><strong id="initialCapital">—</strong><small>Portefeuille virtuel en USDT</small></article>
+<article class="metric"><span>Résultat réalisé net</span><strong id="realizedPnl">—</strong><small>Après frais d’entrée et de sortie</small></article>
+<article class="metric"><span>Liquidités disponibles</span><strong id="cash">—</strong><small>USDT disponibles pour un achat</small></article>
+<article class="metric"><span>Trades clôturés</span><strong id="closedTrades">—</strong><small id="winsLosses">Aucun historique</small></article>
+<article class="metric"><span>Taux de réussite</span><strong id="winRate">—</strong><small id="unrealizedCaption">Latent : —</small></article>
+</div>
+<div class="grid-chart">
+<article class="panel equity-panel"><div class="panel-header"><div><span class="eyebrow">PERFORMANCE OBSERVÉE</span><h2>Évolution du capital</h2></div><span class="tag">USDT</span></div><div class="chart-legend"><span><i class="teal-line"></i> PaperPilot</span><span><i class="orange-line"></i> Conserver BTC</span></div><div id="equityChart" class="chart"><p class="empty">La courbe apparaîtra après les premiers relevés du marché.</p></div><p class="caption">Comparaison BTC depuis le premier cours reçu, avec les mêmes frais estimés. Aucun résultat historique simulé.</p></article>
+<article class="panel position-panel"><div class="panel-header"><div><span class="eyebrow">PORTEFEUILLE</span><h2>Position actuelle</h2></div><span id="positionBadge" class="tag">0 / 1</span></div><div id="positionContent" class="empty-position"><div class="position-glyph">◎</div><strong>Aucune position ouverte</strong><p>Le robot peut attendre aussi longtemps que nécessaire pour trouver une configuration admissible.</p></div></article>
+</div>
+<div class="grid-equal">
+<article class="panel"><div class="panel-header"><div><span class="eyebrow">BINANCE SPOT · COURS PUBLICS</span><h2>Marchés surveillés</h2></div><span id="lastQuote" class="small muted-text">—</span></div><div id="markets" class="markets"><p class="empty">En attente des cotations Binance.</p></div></article>
+<article class="panel"><div class="panel-header"><div><span class="eyebrow">BOUGIES CLÔTURÉES M5 + H1</span><h2>Dernière décision IA</h2></div><span id="lastAnalysis" class="small muted-text">—</span></div><div id="lastDecision" class="decision-empty"><span class="action wait">WAIT</span><p>Aucune analyse enregistrée. Démarrez la simulation après avoir configuré l’IA.</p></div></article>
+</div>
+<article class="panel statistics-panel"><div class="panel-header"><div><span class="eyebrow">MESURES NETTES</span><h2>Qualité des résultats</h2></div><span class="tag">Depuis la réinitialisation</span></div><div class="statistics" id="statistics"></div></article>
+<div class="grid-equal"><article class="panel"><div class="panel-header"><h2>Performance par actif</h2></div><div id="symbolPerformance"></div></article><article class="panel"><div class="panel-header"><h2>Performance journalière</h2></div><div id="dailyPerformance"></div></article></div>
+<article class="panel"><div class="panel-header"><h2>Journal d’activité</h2><span class="tag">Derniers événements</span></div><div id="events" class="events"><p class="empty">Aucun événement pour le moment.</p></div></article>
+</section>
+<section data-page="history" class="hidden">
+<div class="section-heading"><div><h2>Historique des trades</h2><p>Exécutions virtuelles enregistrées à partir du démarrage.</p></div><a class="button" href="/api/export/trades.csv" download>↓ Exporter les trades CSV</a></div>
+<article class="panel table-panel"><div class="table-scroll"><table><thead><tr><th>Ouverture</th><th>Actif</th><th>Achat</th><th>Vente</th><th>Quantité</th><th>Frais</th><th>Résultat net</th><th>Détail</th></tr></thead><tbody id="tradesBody"><tr><td colspan="8" class="empty">Aucun trade clôturé.</td></tr></tbody></table></div></article>
+<div class="section-heading"><div><h2>Décisions et contrôles de risque</h2><p>Une décision WAIT ou un refus d’entrée est un résultat normal.</p></div></div>
+<article class="panel table-panel"><div class="table-scroll"><table><thead><tr><th>Date</th><th>Actif</th><th>Action</th><th>Justification</th><th>Contrôle de risque</th><th>Détail</th></tr></thead><tbody id="decisionsBody"><tr><td colspan="6" class="empty">Aucune décision enregistrée.</td></tr></tbody></table></div></article>
+<div class="export-row"><a class="button subtle" href="/api/export/stats.csv" download>↓ Exporter les statistiques CSV</a></div>
+</section>
+<section data-page="settings" class="hidden">
+<div class="grid-settings"><article class="panel"><div class="panel-header"><div><span class="eyebrow">PERSISTANTS · PAPER UNIQUEMENT</span><h2>Paramètres du robot</h2></div></div><form id="settingsForm">
+<label>Marchés Spot USDT <input id="symbols" name="symbols" required placeholder="BTCUSDT, ETHUSDT, SOLUSDT"><small>Séparez les symboles par une virgule. Les marchés doivent être disponibles sur Binance Spot.</small></label>
+<div class="form-grid"><label>Risque maximal par trade (%)<input name="risk_pct" type="number" min="0.01" max="1" step="0.01" required></label><label>Perte journalière maximale (%)<input name="daily_loss_pct" type="number" min="0.01" max="2" step="0.01" required></label><label>Ratio rendement / risque minimal<input name="min_rr" type="number" min="2" step="0.1" required></label><label>Commission par opération (%)<input name="fee_percent" type="number" min="0.01" max="1" step="0.01" required></label><label>Glissement défavorable (points de base)<input name="slippage_bps" type="number" min="0" max="100" step="1" required></label><label>Spread maximal (points de base)<input name="max_spread_bps" type="number" min="1" max="100" step="1" required></label><label>ATR maximal M5 (%)<input name="max_atr_pct" type="number" min="0.05" max="10" step="0.05" required></label><label>Modèle OpenAI<input name="model" required placeholder="gpt-4o-mini" maxlength="80"></label><label>Plafond d’appels IA / jour UTC<input name="max_daily_calls" type="number" min="0" max="288" step="1" required></label><label>Plafond de tokens IA / jour UTC<input name="max_daily_tokens" type="number" min="0" max="5000000" step="1000" required></label></div><p class="caption">1 point de base = 0,01 %. Une seule position est autorisée. Le risque ne peut pas dépasser 1 % par trade et la limite journalière 2 %.</p><div class="form-actions"><button class="button primary" type="submit">Enregistrer les paramètres</button><span id="settingsSaved" role="status"></span></div></form></article>
+<div><article class="panel config-card"><div class="panel-header"><h2>Connexion à OpenAI</h2><span id="aiTag" class="tag">—</span></div><p>La clé reste uniquement sur votre ordinateur, côté serveur.</p><ol><li>Copiez <code>.env.example</code> et nommez la copie <code>.env</code>.</li><li>Ajoutez votre clé à <code>OPENAI_API_KEY=</code>.</li><li>Relancez l’application avec le script de démarrage.</li></ol><p class="caption">L’API OpenAI est facturée séparément de votre abonnement ChatGPT. Un abonnement ChatGPT ne fournit pas de crédit API.</p><div class="usage"><span>Consommation du jour UTC</span><strong id="usageCalls">—</strong><small id="usageTokens">—</small></div></article>
+<article class="panel danger-card"><h2>Réinitialiser la simulation</h2><p>Supprime les positions, trades, décisions et relevés de cette simulation et rétablit 900 USDT virtuels. Exportez vos résultats avant de continuer.</p><button id="resetButton" class="button danger">Réinitialiser le portefeuille</button></article></div></div>
+</section>
+<footer><span>PaperPilot AI <span class="footer-dot">·</span> Binance Spot <span class="footer-dot">·</span> Paper uniquement</span><p>Les stops virtuels nécessitent un programme allumé et des données disponibles. Les performances passées ou simulées ne garantissent aucun gain.</p></footer>
+</main>
+</div>
+<dialog id="detailDialog"><div class="dialog-header"><h2 id="detailTitle">Détail</h2><button class="icon-button" data-close="detailDialog" aria-label="Fermer">×</button></div><div id="detailSummary"></div><pre id="detailContent"></pre></dialog>
+<dialog id="resetDialog"><div class="dialog-header"><h2>Repartir avec 900 USDT ?</h2><button class="icon-button" data-close="resetDialog" aria-label="Fermer">×</button></div><p>Cette action efface l’historique du portefeuille virtuel et toute position ouverte. Exportez les CSV si vous souhaitez les conserver.</p><label>Saisissez <strong>REINITIALISER</strong> pour confirmer<input id="resetConfirmation" autocomplete="off"></label><div class="form-actions"><button class="button" data-close="resetDialog">Annuler</button><button id="confirmReset" class="button danger">Confirmer la réinitialisation</button></div></dialog>
+<div id="toast" class="toast hidden" role="status"></div>
+</body></html>
