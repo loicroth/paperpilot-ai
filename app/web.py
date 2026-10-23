@@ -76,7 +76,7 @@ def create_app(env=None,store=None,engine=None,background=True):
             if health['last_quote_at']:
                 age=(datetime.now(timezone.utc)-datetime.fromisoformat(health['last_quote_at'])).total_seconds()
                 if age>20: health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message='Dernière cotation trop ancienne. Aucune nouvelle entrée autorisée.')
-            return {'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'position':p,
+            return {'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'position':p,
                 'quotes':[{**asdict(q),'spread_bps':(q.ask-q.bid)/q.bid*10000} for q in bot.quotes.values()],
                 'decisions':decisions,'trades':db.trades()[:250], 'equity':series,
                 'events':db.rows('SELECT at,level,message FROM events ORDER BY id DESC LIMIT 60'),
@@ -105,7 +105,7 @@ def create_app(env=None,store=None,engine=None,background=True):
         try: cfg=Settings.model_validate(await request.json())
         except Exception as exc: raise HTTPException(422,str(exc)[:1000])
         p=db.position()
-        if p and p['symbol'] not in cfg.symbols: raise HTTPException(409,'Conservez le marché de la position ouverte jusqu’à sa clôture.')
+        if p and not cfg.auto_scanner and p['symbol'] not in cfg.symbols: raise HTTPException(409,'Conservez le marché de la position ouverte jusqu’à sa clôture.')
         try: await bot.market.rules(cfg.symbols)
         except Exception as exc: raise HTTPException(400,f'Validation Binance impossible : {str(exc)[:300]}')
         async with bot.lock:

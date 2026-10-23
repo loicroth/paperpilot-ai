@@ -1,0 +1,13 @@
+# Scanner élargi — 23 octobre 2026
+
+Extension livrée : sélection automatique de 30 cryptomonnaies Spot USDT, configurable de 3 à 40, parmi la liste crypto prise en charge dans market.py. Marchés TRADING et Spot uniquement, turnover 24 h >= 5 millions USDT, statistiques récentes. Les actions tokenisées, stablecoins et produits à levier ne sont pas assimilés à des cryptomonnaies ordinaires.
+
+L'univers est recalculé toutes les 15 minutes. Chaque nouvelle clôture M5 déclenche une analyse M5/H1. Deux marchés sont traités en parallèle afin de limiter la concurrence avec la protection des positions. H1 est mis en cache jusqu'à la prochaine clôture horaire. Les cotations du scanner portent leur heure d'observation et ne sont pas rafraîchies à chaque affichage ; BTC, la liste manuelle et la position ouverte continuent d'être suivis par la boucle de protection.
+
+Les configurations respectant les filtres techniques sont classées par ratio de volume (heuristique, pas probabilité de réussite). Quatre candidats maximum sont transmis à l'IA par défaut (1 à 6 configurables), plus la position détenue si nécessaire. En l'absence de candidat et de position, WAIT local avec zéro appel IA. Une position détenue reste dans l'analyse même si elle quitte le classement de liquidité. Une panne sur un marché du scanner l'exclut du cycle ; une panne d'analyse de la position détenue bloque l'appel IA. Les stops continuent via la boucle de protection indépendante.
+
+Risque, limitation à une position, frais, contrôle des signaux et refus des décisions tardives inchangés. Les nouveaux champs de paramètres sont compatibles avec la base existante. AUTO_SCANNER=true fournit le défaut pour les anciens paramètres sans cette clé ; un choix enregistré dans le tableau de bord prend ensuite priorité.
+
+Validation locale : 129 tests réussis, 2 tests réseau optionnels ignorés par la suite standard. Les 7 tests ajoutés vérifient le filtrage de l'univers, le plafonnement de la sélection IA, achat paper et doublons, absence d'appel sans candidat, panne isolée, panne de découverte, suivi d'une position hors univers et persistance. Contrôle syntaxique JavaScript réussi. Un essai réseau manuel a récupéré et calculé les indicateurs de 30 marchés publics en 25,5 secondes avant le resserrement de l'univers crypto. Aucun appel OpenAI authentifié ni preuve de rentabilité. Pas de validation visuelle navigateur automatisée.
+
+Non livré : actions, ETF, futures, CFD, marge, ventes à découvert et levier. Ils nécessitent un flux de cotations accessible au serveur et un modèle de contrats/marge distinct. L'interface signale explicitement leur indisponibilité. Le mode réel reste verrouillé. Aucun nouveau service payant ni abonnement de cotations créé.

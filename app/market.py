@@ -98,7 +98,7 @@ class BinanceClient:
             await self.client.aclose()
 
     async def _get(self, endpoint: str, params: dict | None = None) -> Any:
-        if endpoint not in {"time", "exchangeInfo", "klines", "ticker/bookTicker"}:
+        if endpoint not in {"time", "exchangeInfo", "klines", "ticker/bookTicker", "ticker/24hr"}:
             raise MarketError("Point d'accès non autorisé.")
         if time.monotonic() < self._retry_at:
             raise MarketError("Binance impose une pause de requêtes ; reconnexion différée.")
@@ -143,6 +143,39 @@ class BinanceClient:
                 self.last_error = "Connexion Binance impossible ou réponse invalide. Aucune donnée fabriquée."
                 raise MarketError(self.last_error) from None
         raise MarketError("Données Binance indisponibles.")
+
+    async def liquid_symbols(self, limit: int = 30) -> list[str]:
+        """Rank active USDT Spot markets by real 24h turnover; no synthetic instruments."""
+        now = await self.server_time()
+        info = await self._get("exchangeInfo")
+        tickers = await self._get("ticker/24hr", {"type": "MINI"})
+        if not isinstance(info, dict) or not isinstance(info.get("symbols"), list) or not isinstance(tickers, list):
+            raise MarketError("Liste des marchés indisponible.")
+        excluded = {"USDC", "USDP", "TUSD", "FDUSD", "DAI", "USDE", "USD1", "BUSD", "AEUR", "EURI", "EUR", "PAXG", "XAUT"}
+        # Explicit crypto universe: never treat tokenized stocks, fiat or leveraged
+        # exchange products as ordinary crypto because their symbol ends in USDT.
+        supported = set("BTC ETH SOL BNB XRP ADA DOGE AVAX DOT LINK LTC BCH XLM ATOM NEAR UNI AAVE ICP FIL ETC TRX SUI APT ARB OP INJ SEI TIA RUNE FET RENDER TAO IMX GRT ALGO VET HBAR QNT EOS XTZ EGLD THETA FLOW KAVA CRV LDO MKR SNX COMP ZEC DASH XMR ENA WLD PEPE SHIB BONK FLOKI PENGU ONDO JUP PUMP HYPE JTO STX TON".split())
+        allowed = set()
+        for row in info["symbols"]:
+            base = row.get("baseAsset", "")
+            if (row.get("status") == "TRADING" and row.get("isSpotTradingAllowed") is True
+                and row.get("quoteAsset") == "USDT" and base in supported and base not in excluded
+                and not base.endswith(("UP", "DOWN", "BULL", "BEAR"))):
+                allowed.add(row["symbol"])
+        ranked = []
+        for row in tickers:
+            try:
+                symbol = row["symbol"]
+                self._validate_symbol(symbol)
+                turnover = _positive(row["quoteVolume"], True)
+                if symbol in allowed and turnover >= 5_000_000 and 0 <= now - int(row["closeTime"]) <= 120000:
+                    ranked.append((turnover, symbol))
+            except (KeyError, TypeError, ValueError, MarketError):
+                continue
+        result = [s for _, s in sorted(ranked, reverse=True)[:max(3, min(40, limit))]]
+        if not result:
+            raise MarketError("Aucun marché liquide avec statistiques récentes.")
+        return result
 
     async def server_time(self) -> int:
         async with self._clock_lock:

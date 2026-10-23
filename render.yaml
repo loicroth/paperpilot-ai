@@ -13,6 +13,8 @@ services:
       mountPath: /var/data
       sizeGB: 1
     envVars:
+      - key: AUTO_SCANNER
+        value: "true"
       - key: PYTHON_VERSION
         value: 3.12.8
       - key: HOST

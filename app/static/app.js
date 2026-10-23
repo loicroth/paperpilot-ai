@@ -93,10 +93,16 @@
     if (!quotes.length) { container.append(element('p','empty','En attente des cotations Binance.')); return; }
     for (const quote of quotes) {
       const base = String(quote.symbol).replace(/USDT$/,''), line = element('div','market'), name = element('div','market-name',`${base} / USDT`), price = element('div','market-price');
-      name.append(element('small','','Spot · bid / ask réels'));
+      name.append(element('small','',Date.now()-quote.time_ms>20000 ? 'Cotation du dernier scan · voir heure' : 'Spot · bid / ask observés')); 
       price.append(element('strong','',money((n(quote.bid) !== null && n(quote.ask) !== null) ? (n(quote.bid)+n(quote.ask))/2 : null,false)),element('small','',`Spread ${num(quote.spread_bps ?? ((quote.ask-quote.bid)/quote.bid*10000),2)} pb · ${time(quote.time_ms,true)}`));
       line.append(element('span',`coin ${base}`,base === 'BTC' ? '₿' : base === 'ETH' ? 'Ξ' : base.charAt(0)),name,price); container.append(line);
     }
+  }
+  function renderScanner(scan, enabled) {
+    scan=scan || {}; const rows=array(scan.rows), selected=array(scan.selected);
+    set('#scannerSummary', !enabled ? 'Liste manuelle active. Activez le scanner dans Paramètres pour élargir la recherche.' :
+      scan.error ? `Scan indisponible : ${scan.error}` : scan.at ? `${rows.length} marchés examinés · ${selected.length} retenus pour l’IA · ${time(scan.at)}` : 'Scanner activé : attend la prochaine clôture M5 après Démarrer.');
+    smallTable('#scannerRows',['Marché','État','Motif'],rows.map(r=>[r.symbol,selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
   }
   function renderDecision(decisions) {
     const decision = decisions[0], target = $('#lastDecision'); target.replaceChildren();
@@ -157,6 +163,7 @@
     set('#lastQuote',health.last_quote_at ? `Reçu à ${time(health.last_quote_at,true)}`:'Aucun cours reçu');
     set('#lastAnalysis',health.last_analysis_at ? time(health.last_analysis_at):'Aucune analyse');
     $('#startButton').disabled=control.mode==='running'; $('#pauseButton').disabled=control.mode==='paused' || control.mode==='stopped'; $('#stopButton').disabled=control.mode==='stopped';
+    renderScanner(data.scanner,data.settings?.auto_scanner);
     renderStats(stats);renderPosition(data.position);renderMarkets(array(data.quotes));renderDecision(array(data.decisions));renderTables(array(data.trades),array(data.decisions));renderEvents(array(data.events));renderSettings(data.settings || {},data.usage || {});renderChart(array(data.equity));
   }
   async function refresh() {
@@ -175,7 +182,8 @@
   $('#settingsForm').addEventListener('input',()=>{dirtySettings=true;set('#settingsSaved','Modifications non enregistrées');});
   $('#settingsForm').addEventListener('submit',async(event)=>{
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
-    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','max_daily_calls','max_daily_tokens'])body[key]=Number(form.elements.namedItem(key).value);
+    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist'])body[key]=Number(form.elements.namedItem(key).value);
+    body.auto_scanner=form.elements.auto_scanner.value==='true';
     body.symbols=[...new Set(form.elements.symbols.value.toUpperCase().split(/[,;\s]+/).map(x=>x.replace('/','')).filter(Boolean))];body.model=form.elements.model.value.trim();body.fee_rate=Number(form.elements.fee_percent.value)/100;
     const ok=await mutate('/api/settings','PUT',body,'Paramètres enregistrés.');if(ok){dirtySettings=false;set('#settingsSaved','Enregistré');await refresh();}
   });
