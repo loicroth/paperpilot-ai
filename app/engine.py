@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from dataclasses import asdict
 from .config import Settings
 from .market import BinanceClient, MarketError
-from .indicators import snapshot, candidates
+from .multimarket import MultiMarket
+from .indicators import snapshot, candidates, short_candidates
 from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS
 from .risk import RiskEngine, RiskRejected
 from .execution import PaperExecutionEngine
@@ -16,7 +17,7 @@ log=logging.getLogger('paperpilot')
 class TradingEngine:
     def __init__(self,store,env,market=None,ai=None):
         self.store=store; self.env=env
-        self.market=market or BinanceClient(env.binance_url)
+        self.market=market or MultiMarket(env)
         self.ai=ai or AIClient(env.api_key,model=env.model)
         self.paper=PaperExecutionEngine(store)
         self.quotes={}; self.rules={}
@@ -25,7 +26,7 @@ class TradingEngine:
         self.health=dict(status='DONNÉES INDISPONIBLES',message='Connexion aux données publiques…',market_ok=False,ai_ok=False,last_quote_at=None,last_analysis_at=store.get('last_analysis_at'))
         self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None
         self.started_ms=int(time.time()*1000); self.last_error=None; self.last_snapshot=0.; self.last_analysis_poll=0.; self.closing=False
-        self.reconciled=False; self._settings_revision=0; self.critical_error=None
+        self.reconciled=False; self.provider_setup=False; self._settings_revision=0; self.critical_error=None
         # Process restarts never silently resume autonomous entries.
         self.store.set('mode','stopped')
         self.store.event('Serveur démarré : analyses arrêtées, protection de toute position conservée.')
@@ -103,7 +104,7 @@ class TradingEngine:
             self.reconciled=False
         if not closed:
             # Full current M1 is not yet known; no retrospective favorable fill inferred.
-            self.paper.protect(quote)
+            self.paper.protect(quote,allow_take_profit=self.reconciled)
     async def tick(self):
         cfg=self.settings(); p=self.store.position()
         symbols=list(dict.fromkeys(cfg.symbols+(['BTCUSDT'])+([p['symbol']] if p else [])))
@@ -116,7 +117,14 @@ class TradingEngine:
                 if isinstance(q,BaseException): errors.append(f'{symbol}: {q}'); continue
                 previous=self.quotes.get(symbol)
                 if previous and abs(q.bid/previous.bid-1)>.20:
-                    errors.append(f'{symbol}: variation incohérente supérieure à 20 %, cotation rejetée.'); continue
+                    if p and symbol==p['symbol']:
+                        confirmation=await self.market.quote(symbol)
+                        if abs(confirmation.bid/q.bid-1)>.01:
+                            errors.append(f'{symbol}: cotations de gap contradictoires.');continue
+                        q=confirmation
+                        self.store.event('Gap supérieur à 20 % confirmé sur deux cotations ; protection au cours observé, exécution incertaine.','warning')
+                    else:
+                        errors.append(f'{symbol}: variation incohérente supérieure à 20 %, cotation rejetée.'); continue
                 self.quotes[symbol]=q
             now=await self.market.server_time() # quotes are timestamped at response receipt, after the first clock read
             if p:
@@ -132,17 +140,22 @@ class TradingEngine:
                             observed=await self.market.quote(p['symbol'])
                             self.quotes[p['symbol']]=observed
                             held=self.store.position()
-                            if held and observed.bid<=held['stop_loss']:
+                            if held and held['symbol'].startswith('CAP:'):
+                                self.paper.protect(observed,allow_take_profit=False)
+                            elif held and observed.bid<=held['stop_loss']:
                                 self.paper.sell(observed,'STOP_REPRISE_DONNEES_INCOMPLETES',{'uncertain':True,'method':'Stop dépassé au bid frais observé, historique indisponible ; aucune exécution normale supposée.'})
                             raise
-                        self.paper.protect(self.quotes[p['symbol']])
+                        self.paper.protect(self.quotes[p['symbol']],allow_take_profit=self.reconciled)
                 else: self.reconciled=False
             else: self.reconciled=True
-            if errors: raise MarketError('; '.join(errors))
+            cfd_available=cfg.cfd_enabled and getattr(getattr(self.market,'capital',None),'configured',False)
+            if errors and (not cfd_available or (p and any(e.startswith(p['symbol']+':') for e in errors))):
+                raise MarketError('; '.join(errors))
             now=await self.market.server_time()
-            if not all(s in self.quotes and 0<=now-self.quotes[s].time_ms<=15000 for s in symbols): raise MarketError('Cotations périmées.')
+            required=[p['symbol']] if p and cfd_available else ([] if cfd_available else symbols)
+            if not all(s in self.quotes and 0<=now-self.quotes[s].time_ms<=15000 for s in required): raise MarketError('Cotations périmées.')
             self.health.update(market_ok=True,last_quote_at=utcnow())
-            if not self.store.get('btc_baseline'):
+            if not self.store.get('btc_baseline') and 'BTCUSDT' in self.quotes:
                 entry=self.quotes['BTCUSDT'].ask*(1+cfg.slippage_bps/10000)
                 self.store.set('btc_baseline',{'quantity':self.store.get('initial_capital')/(entry*(1+cfg.fee_rate)),
                     'fee_rate':cfg.fee_rate,'slippage_bps':cfg.slippage_bps})
@@ -191,10 +204,11 @@ class TradingEngine:
         key=f'm5:{expected}'
         if self.store.get('last_cycle')==key: return
         symbols = cfg.symbols
-        slots = asyncio.Semaphore(2)
+        expanded = cfg.auto_scanner or cfg.cfd_enabled
+        slots_by_provider = {'crypto': asyncio.Semaphore(2), 'cfd': asyncio.Semaphore(2)}
         async def market_context(symbol):
-            async with slots:
-                if cfg.auto_scanner:
+            async with slots_by_provider['cfd' if symbol.startswith('CAP:') else 'crypto']:
+                if expanded:
                     quote = await self.market.quote(symbol)
                     previous = self.quotes.get(symbol)
                     if previous and abs(quote.bid / previous.bid - 1) > .20:
@@ -213,27 +227,39 @@ class TradingEngine:
                 if not h1 or h1[-1].close_time!=expected_h1: raise MarketError('Données H1 trop anciennes.')
                 a,b=snapshot(m5),snapshot(h1)
                 q = self.quotes[symbol]
-                setups = candidates(a,b)
+                setups = candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
+                shorts = short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
                 spread = (q.ask-q.bid)/q.bid*10000
                 if spread > cfg.max_spread_bps or a['atr_pct'] > cfg.max_atr_pct:
-                    setups = []
-                return symbol,{'m5':a,'h1':b,'quote':asdict(q)},setups
+                    setups = []; shorts = []
+                directions = (['BUY'] if setups else []) + (['SHORT'] if shorts else [])
+                return symbol,{'m5':a,'h1':b,'quote':asdict(q),'directions':directions,
+                    'direction_candidates':{'BUY':setups,'SHORT':shorts},
+                    'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'}},list(dict.fromkeys(setups+shorts))
         try:
-            if cfg.auto_scanner:
-                if not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit:
-                    self._universe = await self.market.liquid_symbols(cfg.scanner_limit)
-                    self._universe_at = time.monotonic()
+            if expanded:
+                if cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
+                    try:
+                        self._universe = await self.market.liquid_symbols(cfg.scanner_limit)
+                        self._universe_at = time.monotonic()
+                    except MarketError:
+                        if not cfg.cfd_enabled: raise
+                        self._universe=[]
                 held = self.store.position()
-                symbols = list(dict.fromkeys(self._universe + ([held['symbol']] if held else [])))
+                crypto_symbols = self._universe if cfg.auto_scanner else cfg.symbols
+                cfd_symbols = await self.market.cfd_symbols(cfg.cfd_scan_limit) if cfg.cfd_enabled and hasattr(self.market,'cfd_symbols') else []
+                symbols = list(dict.fromkeys(crypto_symbols + cfd_symbols + ([held['symbol']] if held else [])))
+                if held: symbols=[held['symbol']]+[s for s in symbols if s!=held['symbol']]
+
                 raw = await asyncio.gather(*[market_context(s) for s in symbols], return_exceptions=True)
                 rows=[]; valid=[]
                 for symbol, item in zip(symbols, raw):
                     if isinstance(item, BaseException):
-                        rows.append({'symbol':symbol,'status':'INDISPONIBLE','reason':str(item)[:180]})
+                        rows.append({'symbol':symbol,'status':'INDISPONIBLE','reason':str(item)[:180],**(self.market.describe(symbol) if hasattr(self.market,'describe') else {})})
                         if held and held['symbol']==symbol: raise MarketError('Analyse de la position ouverte indisponible.')
                     else:
                         valid.append(item)
-                        rows.append({'symbol':symbol,'status':'CANDIDAT' if item[2] else 'ATTENTE',
+                        rows.append({'symbol':symbol,**item[1]['instrument'],'status':'CANDIDAT' if item[2] else 'ATTENTE',
                             'reason':', '.join(item[2]) or 'Critères techniques, spread ou volatilité non réunis.'})
                 if not valid: raise MarketError('Aucun marché analysable sur ce cycle.')
                 ranked=sorted((r for r in valid if r[2]), key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
@@ -269,7 +295,9 @@ class TradingEngine:
                 self.store.set('last_cycle',key); return
             self.store.set('last_cycle',key)
         stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
-        context={'scanner':self.scan if cfg.auto_scanner else None,'at_utc':utcnow(),'closed_candle_ms':expected,'symbols':cfg.symbols,
+        context={'directions':{s:data.get('directions',[]) for s,data,_ in results},
+            'direction_candidates':{s:data.get('direction_candidates',{}) for s,data,_ in results},
+            'scanner':self.scan if expanded else None,'at_utc':utcnow(),'closed_candle_ms':expected,'symbols':cfg.symbols,
             'markets':{s:data for s,data,_ in results},'candidates':{s:setups for s,_,setups in results},
             'positions':[p] if p else [],'cash':stats['cash'],'equity':stats['equity'],
             'daily_pnl':stats['equity']-day['start_equity'],'rules':cfg.model_dump(),
@@ -299,12 +327,15 @@ class TradingEngine:
                 if self.store.get('mode')=='stopped': raise RiskRejected('Analyses arrêtées pendant l’appel IA.')
                 if not self.health['market_ok'] or not self.reconciled: raise RiskRejected('Données indisponibles ou réconciliation incomplète.')
                 # Fresh quote AFTER the potentially slow AI call. Do not execute on its input price.
-                if decision.action in {'BUY','SELL'}:
+                if decision.action in {'BUY','SHORT','SELL'}:
                     if decision.symbol not in context['markets']: raise RiskRejected('Marché absent de la sélection analysée.')
                     q=await self.market.quote(decision.symbol); self.quotes[decision.symbol]=q
                     if q.time_ms-expected>65000: raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
                     stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
-                    if decision.action=='BUY':
+                    if decision.action in {'BUY','SHORT'}:
+                        if decision.symbol.startswith('CAP:') and self.provider_setup: raise RiskRejected('Connexion de données en cours de modification.')
+                        if decision.action not in context['directions'].get(decision.symbol,[]): raise RiskRejected('Direction non admissible selon le scanner.')
+                        if decision.setup not in context['direction_candidates'].get(decision.symbol,{}).get(decision.action,[]): raise RiskRejected('Configuration non admissible pour cette direction.')
                         self.rules.update(await self.market.rules([decision.symbol]))
                         remaining=max(0,day['start_equity']*cfg.daily_loss_pct/100+(stats['equity']-day['start_equity']))
                         sized_cfg=cfg.model_copy(update={'risk_pct':min(cfg.risk_pct,remaining/max(stats['equity'],1e-12)*100)})

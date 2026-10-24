@@ -10,6 +10,7 @@ def dumps(value): return json.dumps(value, ensure_ascii=False, allow_nan=False, 
 
 class Store:
     def __init__(self, path):
+        had_file=Path(path).exists() and Path(path).stat().st_size>0
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10)
@@ -37,12 +38,28 @@ class Store:
         CREATE TABLE IF NOT EXISTS usage(day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0,
           tokens INTEGER NOT NULL DEFAULT 0);
         ''')
+        if had_file and self.conn.execute('PRAGMA user_version').fetchone()[0]<2:
+            backups=Path(path).parent/'backups';backups.mkdir(exist_ok=True)
+            name='avant_multimarche_'+__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y%m%d_%H%M%S_%f')+'.sqlite3'
+            with sqlite3.connect(str(backups/name)) as backup: self.conn.backup(backup)
+        # Additive, idempotent migration: existing spot positions/history retain defaults.
+        columns={row[1] for row in self.conn.execute('PRAGMA table_info(trades)')}
+        additions={
+            'kind': "TEXT NOT NULL DEFAULT 'spot'", 'direction': "TEXT NOT NULL DEFAULT 'LONG'",
+            'margin': 'REAL NOT NULL DEFAULT 0', 'leverage': 'REAL NOT NULL DEFAULT 1',
+            'multiplier': 'REAL NOT NULL DEFAULT 1', 'currency': "TEXT NOT NULL DEFAULT 'USDT'",
+            'fx_open': 'REAL NOT NULL DEFAULT 1', 'financing_daily': 'REAL NOT NULL DEFAULT 0',
+            'financing_accrued': 'REAL NOT NULL DEFAULT 0', 'financing_at': 'INTEGER NOT NULL DEFAULT 0',
+            'maintenance_margin_pct': 'REAL NOT NULL DEFAULT 50',
+            'last_bid': 'REAL', 'last_ask': 'REAL', 'last_fx_bid': 'REAL', 'last_fx_ask': 'REAL'}
         with self.transaction():
+            for name, declaration in additions.items():
+                if name not in columns: self.conn.execute(f'ALTER TABLE trades ADD COLUMN {name} {declaration}')
             if self.get('cash') is None:
                 self.set('cash',900.0); self.set('initial_capital',900.0)
                 self.set('settings',Settings().model_dump()); self.set('mode','stopped')
                 self.set('session_started',utcnow())
-            self.conn.execute("PRAGMA user_version=1")
+            self.conn.execute("PRAGMA user_version=2")
     @contextmanager
     def transaction(self):
         with self.lock:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import defaultdict
+from .execution import cfd_valuation
 
 def statistics(store,quotes):
     p=store.position(); cash=store.get('cash',900.); initial=store.get('initial_capital',900.)
@@ -8,11 +9,16 @@ def statistics(store,quotes):
     if p:
         q=quotes.get(p['symbol'])
         # A stale valuation is labelled in health, never used to open trades.
-        market=q.bid if q else p['entry']
-        net_exit=market*(1-p['slippage_bps']/10000)*(1-p['fee_rate'])
-        equity+=p['quantity']*net_exit
-        unrealized=p['quantity']*(net_exit-p['entry'])-p['entry_fee']
-        p.update(current_price=market,unrealized_pnl=unrealized)
+        if p.get('kind')=='cfd':
+            valuation=cfd_valuation(p,q)
+            equity+=valuation['equity_add'];unrealized=valuation['unrealized_pnl']
+            p.update({k:v for k,v in valuation.items() if k!='equity_add'})
+        else:
+            market=q.bid if q else p['entry']
+            net_exit=market*(1-p['slippage_bps']/10000)*(1-p['fee_rate'])
+            equity+=p['quantity']*net_exit
+            unrealized=p['quantity']*(net_exit-p['entry'])-p['entry_fee']
+            p.update(current_price=market,unrealized_pnl=unrealized)
     wins=[t['net_pnl'] for t in trades if t['net_pnl']>0]
     losses=[t['net_pnl'] for t in trades if t['net_pnl']<0]
     series=store.rows('SELECT * FROM equity ORDER BY id')
@@ -31,6 +37,7 @@ def statistics(store,quotes):
         winners=len(wins),losers=len(losses),avg_win=sum(wins)/len(wins) if wins else 0,avg_loss=sum(losses)/len(losses) if losses else 0,
         profit_factor=sum(wins)/abs(sum(losses)) if losses else None,max_drawdown_pct=maxdd,
         realized_rr=sum(t['net_pnl']/t['risk_usdt'] for t in trades)/len(trades) if trades else 0,
+        margin_used=p.get('margin',0.) if p else 0.,financing_total=sum(t.get('financing_accrued',0.) for t in trades)+(p.get('financing_usdt',0.) if p else 0.),
         total_fees=sum(t['fees'] for t in trades)+(p['entry_fee'] if p else 0),by_symbol=dict(by),
         daily=[{'date':d,**v} for d,v in sorted(daily.items())],btc_benchmark_equity=benchmark)
     return stats,p

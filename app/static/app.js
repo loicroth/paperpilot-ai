@@ -6,6 +6,9 @@
   const n = (value) => value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value) : null;
   const num = (value, digits = 2) => n(value) === null ? '—' : new Intl.NumberFormat('fr-CH', {minimumFractionDigits: digits, maximumFractionDigits: digits}).format(n(value));
   const money = (value, unit = true) => `${num(value)}${unit && n(value) !== null ? ' USDT' : ''}`;
+  const isCFD = (item) => item?.kind === 'cfd' || String(item?.symbol || '').startsWith('CAP:');
+  const priceText = (value, item) => `${num(value, isCFD(item) && n(value) !== null && n(value) < 10 ? 5 : 2)} ${item?.currency || (isCFD(item) ? 'USD' : 'USDT')}`;
+  const assetName = (value) => ({crypto:'Crypto Spot',shares:'Actions CFD',share:'Actions CFD',equity:'Actions CFD',stock:'Actions CFD',etf:'ETF CFD',indices:'Indices CFD',index:'Indices CFD',forex:'Devises CFD',currencies:'Devises CFD',currency:'Devises CFD',commodities:'Matières premières CFD',commodity:'Matières premières CFD'}[String(value || '').toLowerCase()] || value || 'CFD');
   const signed = (value) => n(value) === null ? '—' : `${n(value) > 0 ? '+' : ''}${num(value)}`;
   const time = (value, short = false) => {
     if (value === null || value === undefined || value === '') return '—';
@@ -62,6 +65,8 @@
       ['Drawdown maximal', `${num(stats.max_drawdown_pct)} %`],['Gain moyen net', money(stats.avg_win)],['Perte moyenne nette', money(stats.avg_loss)],
       ['Ratio R réalisé moyen', num(stats.realized_rr)],['Frais cumulés', money(stats.total_fees)],['Gains latents', `${signed(stats.unrealized_pnl)} USDT`],['Conserver BTC · capital', money(stats.btc_benchmark_equity)]
     ];
+    if (n(stats.margin_used) !== null) metrics.push(['Marge CFD immobilisée', money(stats.margin_used)]);
+    if (n(stats.financing_total) !== null) metrics.push(['Financement CFD simulé cumulé', money(stats.financing_total)]);
     const container = $('#statistics'); container.replaceChildren();
     for (const [label,value] of metrics) { const item = element('div','stat'); item.append(element('small','',label),element('strong','',value)); container.append(item); }
     let by = stats.by_symbol;
@@ -79,30 +84,54 @@
     rows.forEach(row => { const line = element('tr'); row.forEach(value => line.append(element('td','',value))); body.append(line); }); target.append(table);
   }
   function renderPosition(position) {
-    const target = $('#positionContent'), panel = $('.position-panel'); target.replaceChildren(); panel.classList.toggle('has-position',Boolean(position)); set('#positionBadge',position ? '1 / 1 · SPOT' : '0 / 1');
+    const target = $('#positionContent'), panel = $('.position-panel'); target.replaceChildren(); panel.classList.toggle('has-position',Boolean(position)); set('#positionBadge',position ? `1 / 1 · ${isCFD(position) ? 'CFD' : 'SPOT'}` : '0 / 1');
     if (!position) { target.className = 'empty-position'; target.append(element('div','position-glyph','◎'),element('strong','','Aucune position ouverte'),element('p','','Le robot peut attendre aussi longtemps que nécessaire pour trouver une configuration admissible.')); return; }
     target.className = '';
-    const heading = element('div','position-symbol'); const profit = element('span','badge',`${signed(position.unrealized_pnl)} USDT`); pnlClass(profit,position.unrealized_pnl); heading.append(element('strong','',position.symbol),profit); target.append(heading);
+    const heading = element('div','position-symbol'); const profit = element('span','badge',`${signed(position.unrealized_pnl)} USDT`); pnlClass(profit,position.unrealized_pnl); heading.append(element('strong','',`${position.symbol}${isCFD(position) ? ' · '+(position.direction || 'LONG') : ''}`),profit); target.append(heading);
     const grid = element('div','position-data');
-    const values = [['Prix d’entrée',money(position.entry,false)],['Prix actuel',money(position.current_price,false)],['Quantité',num(position.quantity,8)],['Stop-loss',money(position.stop_loss,false)],['Take-profit',money(position.take_profit,false)],['Ouverte le',time(position.opened_at)]];
+    const values = [['Prix d’entrée',priceText(position.entry,position)],['Prix actuel',priceText(position.current_price,position)],['Quantité',num(position.quantity,8)],['Stop-loss',priceText(position.stop_loss,position)],['Take-profit',priceText(position.take_profit,position)],['Ouverte le',time(position.opened_at)]];
+    if (isCFD(position)) values.push(['Sens',position.direction || 'LONG'],['Levier',`${num(position.leverage,1)}×`],['Marge immobilisée',money(position.margin)],['Financement simulé',money(position.financing_accrued)],['Durée maximale CFD','24 h puis première cotation négociable']);
     values.forEach(([label,value]) => { const item = element('div'); item.append(element('small','',label),element('strong','',value)); grid.append(item); }); target.append(grid);
     target.append(element('p','position-bottom',position.entry_reason || 'Protection virtuelle surveillée tant que les données sont disponibles.'));
   }
   function renderMarkets(quotes) {
     const container = $('#markets'); container.replaceChildren();
-    if (!quotes.length) { container.append(element('p','empty','En attente des cotations Binance.')); return; }
+    if (!quotes.length) { container.append(element('p','empty','En attente des cotations des sources connectées.')); return; }
     for (const quote of quotes) {
-      const base = String(quote.symbol).replace(/USDT$/,''), line = element('div','market'), name = element('div','market-name',`${base} / USDT`), price = element('div','market-price');
-      name.append(element('small','',Date.now()-quote.time_ms>20000 ? 'Cotation du dernier scan · voir heure' : 'Spot · bid / ask observés')); 
-      price.append(element('strong','',money((n(quote.bid) !== null && n(quote.ask) !== null) ? (n(quote.bid)+n(quote.ask))/2 : null,false)),element('small','',`Spread ${num(quote.spread_bps ?? ((quote.ask-quote.bid)/quote.bid*10000),2)} pb · ${time(quote.time_ms,true)}`));
-      line.append(element('span',`coin ${base}`,base === 'BTC' ? '₿' : base === 'ETH' ? 'Ξ' : base.charAt(0)),name,price); container.append(line);
+      const cfd=isCFD(quote), base=String(quote.symbol).replace(/^CAP:/,'').replace(/USDT$/,''), line=element('div','market'), name=element('div','market-name',quote.label || (cfd?base:`${base} / USDT`)), price=element('div','market-price');
+      const old=Date.now()-quote.time_ms>20000;
+      name.append(element('small','',cfd ? `CFD démo · ${quote.currency || 'USD'}${quote.market_status && quote.market_status!=='TRADEABLE'?' · '+quote.market_status:''}${old?' · voir heure':''}` : old ? 'Cotation du dernier scan · voir heure' : 'Spot · bid / ask observés'));
+      price.append(element('strong','',priceText((n(quote.bid)!==null && n(quote.ask)!==null)?(n(quote.bid)+n(quote.ask))/2:null,quote)),element('small','',`Spread ${num(quote.spread_bps ?? ((quote.ask-quote.bid)/quote.bid*10000),2)} pb · ${time(quote.time_ms,true)}`));
+      line.append(element('span',`coin${cfd?' cfd-coin':''}`,cfd?'C':base==='BTC'?'₿':base==='ETH'?'Ξ':base.charAt(0)),name,price); container.append(line);
+    }
+  }
+  function renderProviders(providers) {
+    const capital=providers?.capital || {}, supported=array(capital.supported), blocked=array(capital.blocked), box=$('#providerOverview'), markets=$('#capitalMarkets');
+    box.replaceChildren(); markets.replaceChildren();
+    const label=capital.connected?'CFD démo connectés':capital.configured?'CFD configurés · connexion à vérifier':'CFD non connectés';
+    set('#capitalTag',capital.connected?'Démo connectée':capital.configured?'À vérifier':'Non connectés');
+    const text=capital.error || (capital.connected ? `Cotations CFD démo disponibles : ${supported.length} contrats validés. Le scanner doit être activé dans les paramètres.` : capital.configured ? 'Connexion enregistrée. Les contrats ne seront utilisés qu’après validation des cotations et des règles.' : 'Ajoutez une connexion Capital.com démo pour débloquer les cotations CFD.');
+    set('#capitalStatus',text);
+    box.append(element('strong','',label),element('p','',text),element('small','muted-text','Binance Spot · CFD sur actions / ETF / indices / devises / matières premières selon les contrats validés · futures de bourse non intégrés.'));
+    const fx=providers?.fx;
+    if (fx?.error) box.append(element('p','rejection',`Conversion USD / USDT indisponible : ${fx.error}`));
+    if (supported.length) {
+      markets.append(element('strong','','Contrats validés pour le scanner'));
+      const list=element('ul','provider-list');
+      supported.slice(0,40).forEach(item=>list.append(element('li','',typeof item==='string'?item:`${item.label || item.name || item.symbol || item.epic} · ${assetName(item.asset_class || item.type)}`)));
+      markets.append(list);
+    }
+    if (blocked.length) {
+      const expander=element('details','provider-blocked'), summary=element('summary','',`${blocked.length} marché(s) exclu(s)`), list=element('ul','provider-list');
+      blocked.slice(0,40).forEach(item=>list.append(element('li','',typeof item==='string'?item:`${item.label || item.name || item.symbol || item.epic || 'Marché'} : ${item.reason || item.error || 'Règles ou données non validées'}`)));
+      expander.append(summary,list); markets.append(expander);
     }
   }
   function renderScanner(scan, enabled) {
     scan=scan || {}; const rows=array(scan.rows), selected=array(scan.selected);
     set('#scannerSummary', !enabled ? 'Liste manuelle active. Activez le scanner dans Paramètres pour élargir la recherche.' :
       scan.error ? `Scan indisponible : ${scan.error}` : scan.at ? `${rows.length} marchés examinés · ${selected.length} retenus pour l’IA · ${time(scan.at)}` : 'Scanner activé : attend la prochaine clôture M5 après Démarrer.');
-    smallTable('#scannerRows',['Marché','État','Motif'],rows.map(r=>[r.symbol,selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
+    smallTable('#scannerRows',['Marché','Famille','État','Motif'],rows.map(r=>[r.label || r.symbol,assetName(r.asset_class || (String(r.symbol || '').startsWith('CAP:')?'CFD':'crypto')),selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
   }
   function renderDecision(decisions) {
     const decision = decisions[0], target = $('#lastDecision'); target.replaceChildren();
@@ -115,7 +144,7 @@
     const tradeBody = $('#tradesBody'); tradeBody.replaceChildren();
     if (!trades.length) { const row = element('tr'),cell = element('td','empty','Aucun trade clôturé. Aucun historique artificiel n’est généré.'); cell.colSpan=8; row.append(cell); tradeBody.append(row); }
     trades.forEach(trade => {
-      const row = element('tr'); [time(trade.opened_at),trade.symbol,money(trade.entry,false),money(trade.exit,false),num(trade.quantity,8),money(trade.fees,false)].forEach(x => row.append(element('td','',x)));
+      const row = element('tr'); [time(trade.opened_at),`${trade.symbol}${isCFD(trade)?' · '+(trade.direction || 'LONG'):''}`,priceText(trade.entry,trade),priceText(trade.exit,trade),num(trade.quantity,8),money(trade.fees)].forEach(x => row.append(element('td','',x)));
       const pnl = element('td','',signed(trade.net_pnl)); pnlClass(pnl,trade.net_pnl); row.append(pnl); const detailCell = element('td'); detailCell.append(detailButton(`Trade ${trade.symbol}`,`${time(trade.opened_at)} → ${time(trade.closed_at)} · ${trade.exit_reason || ''}`,trade.detail || trade)); row.append(detailCell); tradeBody.append(row);
     });
     const decisionBody = $('#decisionsBody'); decisionBody.replaceChildren();
@@ -163,7 +192,8 @@
     set('#lastQuote',health.last_quote_at ? `Reçu à ${time(health.last_quote_at,true)}`:'Aucun cours reçu');
     set('#lastAnalysis',health.last_analysis_at ? time(health.last_analysis_at):'Aucune analyse');
     $('#startButton').disabled=control.mode==='running'; $('#pauseButton').disabled=control.mode==='paused' || control.mode==='stopped'; $('#stopButton').disabled=control.mode==='stopped';
-    renderScanner(data.scanner,data.settings?.auto_scanner);
+    renderProviders(data.providers);
+    renderScanner(data.scanner,data.settings?.auto_scanner || data.settings?.cfd_enabled);
     renderStats(stats);renderPosition(data.position);renderMarkets(array(data.quotes));renderDecision(array(data.decisions));renderTables(array(data.trades),array(data.decisions));renderEvents(array(data.events));renderSettings(data.settings || {},data.usage || {});renderChart(array(data.equity));
   }
   async function refresh() {
@@ -182,10 +212,29 @@
   $('#settingsForm').addEventListener('input',()=>{dirtySettings=true;set('#settingsSaved','Modifications non enregistrées');});
   $('#settingsForm').addEventListener('submit',async(event)=>{
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
-    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist'])body[key]=Number(form.elements.namedItem(key).value);
+    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
     body.auto_scanner=form.elements.auto_scanner.value==='true';
+    body.cfd_enabled=form.elements.cfd_enabled.value==='true';
+    body.allow_short=form.elements.allow_short.value==='true';
     body.symbols=[...new Set(form.elements.symbols.value.toUpperCase().split(/[,;\s]+/).map(x=>x.replace('/','')).filter(Boolean))];body.model=form.elements.model.value.trim();body.fee_rate=Number(form.elements.fee_percent.value)/100;
     const ok=await mutate('/api/settings','PUT',body,'Paramètres enregistrés.');if(ok){dirtySettings=false;set('#settingsSaved','Enregistré');await refresh();}
+  });
+  $('#capitalForm').addEventListener('submit',async(event)=>{
+    event.preventDefault(); const form=event.target, button=$('#capitalConnect');
+    if(!form.reportValidity() || button.disabled)return;
+    button.disabled=true;set('#capitalStatus','Vérification de la connexion démo…');
+    const body={identifier:form.elements.identifier.value.trim(),api_key:form.elements.api_key.value.trim(),api_password:form.elements.api_password.value};
+    try {
+      await request('/api/providers/capital/setup','POST',body);
+      form.reset(); await refresh(); notify('Connexion démo enregistrée. Activez le scanner CFD dans les paramètres.');
+    } catch (_) {
+      // Credential setup errors must never echo an API response that could contain a secret.
+      set('#capitalStatus','Connexion démo impossible. Vérifiez votre e-mail, votre clé et le mot de passe API personnalisé, puis réessayez.');
+      notify('La connexion Capital.com démo n’a pas pu être vérifiée.',true);
+    } finally {
+      form.elements.api_key.value=''; form.elements.api_password.value='';
+      body.api_key='';body.api_password='';button.disabled=false;
+    }
   });
   $('#resetButton').addEventListener('click',()=>{$('#resetConfirmation').value='';$('#resetDialog').showModal();$('#resetConfirmation').focus();});
   $('#confirmReset').addEventListener('click',async()=>{if($('#resetConfirmation').value!=='REINITIALISER'){notify('Saisissez exactement REINITIALISER pour confirmer.',true);return;}if(await mutate('/api/reset','POST',{confirmation:'REINITIALISER'},'Portefeuille réinitialisé à 900 USDT virtuels.'))$('#resetDialog').close();});

@@ -76,7 +76,7 @@ def create_app(env=None,store=None,engine=None,background=True):
             if health['last_quote_at']:
                 age=(datetime.now(timezone.utc)-datetime.fromisoformat(health['last_quote_at'])).total_seconds()
                 if age>20: health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message='Dernière cotation trop ancienne. Aucune nouvelle entrée autorisée.')
-            return {'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'position':p,
+            return {'providers':bot.market.status() if hasattr(bot.market,'status') else {},'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'position':p,
                 'quotes':[{**asdict(q),'spread_bps':(q.ask-q.bid)/q.bid*10000} for q in bot.quotes.values()],
                 'decisions':decisions,'trades':db.trades()[:250], 'equity':series,
                 'events':db.rows('SELECT at,level,message FROM events ORDER BY id DESC LIMIT 60'),
@@ -105,7 +105,7 @@ def create_app(env=None,store=None,engine=None,background=True):
         try: cfg=Settings.model_validate(await request.json())
         except Exception as exc: raise HTTPException(422,str(exc)[:1000])
         p=db.position()
-        if p and not cfg.auto_scanner and p['symbol'] not in cfg.symbols: raise HTTPException(409,'Conservez le marché de la position ouverte jusqu’à sa clôture.')
+        if p and not p['symbol'].startswith('CAP:') and not cfg.auto_scanner and p['symbol'] not in cfg.symbols: raise HTTPException(409,'Conservez le marché de la position ouverte jusqu’à sa clôture.')
         try: await bot.market.rules(cfg.symbols)
         except Exception as exc: raise HTTPException(400,f'Validation Binance impossible : {str(exc)[:300]}')
         async with bot.lock:
@@ -114,6 +114,28 @@ def create_app(env=None,store=None,engine=None,background=True):
             stats,_=statistics(db,bot.quotes); bot.day_state(stats['equity'])
             db.event('Paramètres enregistrés. Les frais de chaque position restent ceux de son ouverture.')
         return {'ok':True}
+    @app.post('/api/providers/capital/setup')
+    async def capital_setup(request:Request):
+        if not hasattr(bot.market,'setup_capital'): raise HTTPException(409,'Source CFD indisponible.')
+        body=await request.json()
+        if not isinstance(body,dict) or set(body)!={'api_key','identifier','api_password'} or any(not isinstance(v,str) or not v.strip() or len(v)>1024 for v in body.values()):
+            raise HTTPException(422,'Les trois champs de connexion démo sont requis.')
+        async with bot.lock:
+            if bot.provider_setup: raise HTTPException(409,'Connexion déjà en cours.')
+            if db.position() and db.position()['symbol'].startswith('CAP:'):
+                raise HTTPException(409,'Clôturez la position CFD avant de remplacer sa connexion de données.')
+            bot.provider_setup=True; bot._settings_revision+=1
+        try:
+            await bot.market.setup_capital(body)
+            async with bot.lock:
+                bot._settings_revision+=1; bot._h1={}
+                db.event('Source de cotations Capital.com démo connectée. Activez les CFD dans Paramètres pour les analyser.')
+        except Exception:
+            raise HTTPException(400,'Connexion démo impossible. Vérifiez les trois champs et la disponibilité de Capital.com.') from None
+        finally:
+            bot.provider_setup=False
+        return {'configured':True}
+
     @app.post('/api/reset')
     async def reset(request:Request):
         body=await request.json()
@@ -135,7 +157,7 @@ def create_app(env=None,store=None,engine=None,background=True):
         return Response(buffer.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
     @app.get('/api/export/trades.csv')
     async def export_trades():
-        return csv_response(db.trades(),['id','symbol','opened_at','closed_at','entry','exit','quantity','fees','net_pnl','risk_usdt','entry_reason','exit_reason'],'trades_paper.csv')
+        return csv_response(db.trades(),['id','symbol','kind','direction','currency','leverage','margin','opened_at','closed_at','entry','exit','quantity','fees','financing_accrued','net_pnl','risk_usdt','entry_reason','exit_reason'],'trades_paper.csv')
     @app.get('/api/export/stats.csv')
     async def export_stats():
         stats,_=statistics(db,bot.quotes)

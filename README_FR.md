@@ -1,3 +1,11 @@
+# Extension multi-marchés (24 octobre 2026)
+
+La version déployée conserve le portefeuille900USDT et son historique. Elle ajoute la simulation CFD LONG/SHORT (actions sous-jacentes,ETF,indices,forex,matières premières) avec levier plafonné, marge et financement estimé. Les actions détenues directement et les futures de bourse ne sont pas pris en charge.
+
+Pour les CFD : Paramètres → Capital.com démo → connecter les trois identifiants API démo → activer le scanner CFD → enregistrer → Démarrer. Ne communiquez pas les secrets dans le chat. Aucun ordre courtier n'est envoyé. La source démo et les contrats accessibles doivent encore être validés avec votre compte.
+
+Voir [docs/MULTIMARCHE.md](docs/MULTIMARCHE.md) pour les protections, coûts simulés, limites et tests. Le reste du guide couvre l'installation locale et la crypto Spot.
+
 # PaperPilot AI — Binance Spot, portefeuille virtuel
 
 Application locale Python : vrais cours Binance, décisions OpenAI, portefeuille fictif de **900 USDT**. Aucune clé Binance, aucun ordre réel. Le moteur réel est verrouillé dans cette version.

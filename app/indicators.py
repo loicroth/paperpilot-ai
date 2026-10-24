@@ -57,6 +57,7 @@ def snapshot(candles: Sequence[Candle]) -> dict:
         "support": support, "resistance": resistance,
         "recent_high": max(c.high for c in candles[-5:]),
         "recent_low": min(c.low for c in candles[-5:]),
+        "volume_available": all(getattr(c,"volume_available",True) for c in candles) and any(c.volume>0 for c in candles),
         "volume_ratio": candles[-1].volume / avg_volume if avg_volume > 0 else 0.,
         "change_pct": (closes[-1] / closes[-2] - 1) * 100,
         "last": asdict(candles[-1]), "previous": asdict(candles[-2]),
@@ -69,13 +70,14 @@ def snapshot(candles: Sequence[Candle]) -> dict:
     return result
 
 
-def candidates(m5: dict, h1: dict) -> list[str]:
+def candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
     """Deterministic LONG setup admission; IA chooses at most one admissible market.
 
     Breakout, retest, consolidation resumption need an upward H1 context.
     Reversal additionally needs an improving H1 structure above EMA21.
     These are constraints, not a claim of a profitable edge.
     """
+    volume_ok = lambda threshold: (not require_volume and not m5.get("volume_available",True)) or m5["volume_ratio"] >= threshold
     last, previous = m5["last"], m5["previous"]
     close, atr = last["close"], m5["atr14"]
     if atr <= 0 or not .03 <= m5["atr_pct"] <= 3:
@@ -90,22 +92,40 @@ def candidates(m5: dict, h1: dict) -> list[str]:
     momentum = m5["ema9"] > m5["ema21"] and m5["macd_hist"] > 0
     result = []
     rows = m5["candles"]
-    if uptrend and momentum and close > m5["resistance"] and m5["volume_ratio"] >= 1.2:
+    if uptrend and momentum and close > m5["resistance"] and volume_ok(1.2):
         result.append("breakout")
     # Previous close must have broken the earlier range, then latest retests it from above.
     if len(rows) >= 22:
         old_resistance = max(c["high"] for c in rows[-22:-2])
-        if uptrend and momentum and previous["close"] > old_resistance and last["low"] <= old_resistance + .3 * atr and last["low"] >= old_resistance - .5 * atr and close > old_resistance and m5["volume_ratio"] >= .8:
+        if uptrend and momentum and previous["close"] > old_resistance and last["low"] <= old_resistance + .3 * atr and last["low"] >= old_resistance - .5 * atr and close > old_resistance and volume_ok(.8):
             result.append("retest")
     if len(rows) >= 8:
         box = rows[-7:-1]
         box_high, box_low = max(c["high"] for c in box), min(c["low"] for c in box)
-        if uptrend and momentum and box_high - box_low <= 2 * atr and close > box_high and m5["volume_ratio"] >= 1.1:
+        if uptrend and momentum and box_high - box_low <= 2 * atr and close > box_high and volume_ok(1.1):
             result.append("consolidation")
     if len(rows) >= 12:
         older_low = min(c["low"] for c in rows[-12:-6])
         newer_low = min(c["low"] for c in rows[-6:-1])
         pivot = max(c["high"] for c in rows[-4:-1])
-        if newer_low > older_low and close > pivot and close > m5["ema21"] and m5["macd_hist"] > m5["macd_hist_previous"] and m5["volume_ratio"] >= 1.2:
+        if newer_low > older_low and close > pivot and close > m5["ema21"] and m5["macd_hist"] > m5["macd_hist_previous"] and volume_ok(1.2):
             result.append("reversal")
     return result
+
+
+def short_candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
+    """Mirror the exact LONG structural filters, solely for authorised CFDs."""
+    def mirror(data):
+        # Reflection about a positive anchor preserves EMA distances, ATR and volume.
+        anchor = 2 * max(data['recent_high'], data['resistance'], max(c['high'] for c in data['candles']), data['ema50'], data['ema21'])
+        def bar(c):
+            return {**c, 'open':anchor-c['open'], 'close':anchor-c['close'], 'high':anchor-c['low'], 'low':anchor-c['high']}
+        result = dict(data)
+        for key in ('ema9','ema21','ema50','ema21_previous','ema50_previous'):
+            result[key] = anchor-data[key]
+        for key in ('macd','macd_signal','macd_hist','macd_hist_previous'): result[key] = -data[key]
+        result.update(rsi14=100-data['rsi14'],support=anchor-data['resistance'],resistance=anchor-data['support'],
+            recent_low=anchor-data['recent_high'],recent_high=anchor-data['recent_low'],
+            last=bar(data['last']),previous=bar(data['previous']),candles=[bar(c) for c in data['candles']])
+        return result
+    return candidates(mirror(m5),mirror(h1),require_volume=require_volume)

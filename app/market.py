@@ -25,6 +25,7 @@ class Candle:
     low: float
     close: float
     volume: float
+    volume_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,11 @@ class Quote:
     bid: float
     ask: float
     time_ms: int
+    conversion_rate: float = 1.0
+    currency: str = 'USDT'
+    market_status: str = 'TRADEABLE'
+    conversion_bid: float | None = None
+    conversion_ask: float | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,14 @@ class Rules:
     min_notional: float
     max_notional: float
     tick_size: float = 0.0
+    asset_class: str = 'crypto'
+    provider: str = 'binance'
+    currency: str = 'USDT'
+    multiplier: float = 1.0
+    min_margin_pct: float = 100.0
+    allow_short: bool = False
+    financing_daily: float = 0.0
+    maintenance_margin_pct: float = 50.0
 
 
 _INTERVALS = {"1s": 1000, "1m": 60000, "3m": 180000, "5m": 300000,

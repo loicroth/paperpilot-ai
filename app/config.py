@@ -13,6 +13,11 @@ class Settings(BaseModel):
     auto_scanner: bool = Field(default_factory=lambda: os.getenv('AUTO_SCANNER', 'false').lower() == 'true')
     scanner_limit: int = Field(default=30, ge=3, le=40)
     ai_shortlist: int = Field(default=4, ge=1, le=6)
+    cfd_enabled: bool = False
+    cfd_leverage: float = Field(default=2, ge=1, le=5)
+    allow_short: bool = True
+    cfd_financing_daily: float = Field(default=0.001, ge=0.0001, le=0.01)
+    cfd_scan_limit: int = Field(default=20, ge=3, le=40)
     risk_pct: float = Field(default=1.0, gt=0, le=1)
     daily_loss_pct: float = Field(default=2.0, gt=0, le=2)
     min_rr: float = Field(default=2.0, ge=2, le=20)
