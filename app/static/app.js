@@ -105,12 +105,12 @@
       line.append(element('span',`coin${cfd?' cfd-coin':''}`,cfd?'C':base==='BTC'?'₿':base==='ETH'?'Ξ':base.charAt(0)),name,price); container.append(line);
     }
   }
-  function renderProviders(providers) {
+  function renderProviders(providers, cfdEnabled) {
     const capital=providers?.capital || {}, supported=array(capital.supported), blocked=array(capital.blocked), box=$('#providerOverview'), markets=$('#capitalMarkets');
     box.replaceChildren(); markets.replaceChildren();
     const label=capital.connected?'CFD démo connectés':capital.configured?'CFD configurés · connexion à vérifier':'CFD non connectés';
     set('#capitalTag',capital.connected?'Démo connectée':capital.configured?'À vérifier':'Non connectés');
-    const text=capital.error || (capital.connected ? `Cotations CFD démo disponibles : ${supported.length} contrats validés. Le scanner doit être activé dans les paramètres.` : capital.configured ? 'Connexion enregistrée. Les contrats ne seront utilisés qu’après validation des cotations et des règles.' : 'Ajoutez une connexion Capital.com démo pour débloquer les cotations CFD.');
+    const text=capital.error || (capital.connected ? `Source de cotations CFD démo : ${supported.length} contrats validés. ${cfdEnabled ? 'Scanner CFD activé. Seuls les marchés ouverts et admissibles sont analysés lorsque le robot fonctionne.' : 'Scanner CFD désactivé : activez-le dans les paramètres pour analyser les marchés ouverts et admissibles.'}` : capital.configured ? 'Connexion enregistrée. Les contrats ne seront utilisés qu’après validation des cotations et des règles.' : 'Ajoutez une connexion Capital.com démo pour débloquer les cotations CFD.');
     set('#capitalStatus',text);
     box.append(element('strong','',label),element('p','',text),element('small','muted-text','Binance Spot · CFD sur actions / ETF / indices / devises / matières premières selon les contrats validés · futures de bourse non intégrés.'));
     const fx=providers?.fx;
@@ -192,7 +192,7 @@
     set('#lastQuote',health.last_quote_at ? `Reçu à ${time(health.last_quote_at,true)}`:'Aucun cours reçu');
     set('#lastAnalysis',health.last_analysis_at ? time(health.last_analysis_at):'Aucune analyse');
     $('#startButton').disabled=control.mode==='running'; $('#pauseButton').disabled=control.mode==='paused' || control.mode==='stopped'; $('#stopButton').disabled=control.mode==='stopped';
-    renderProviders(data.providers);
+    renderProviders(data.providers, data.settings?.cfd_enabled === true);
     renderScanner(data.scanner,data.settings?.auto_scanner || data.settings?.cfd_enabled);
     renderStats(stats);renderPosition(data.position);renderMarkets(array(data.quotes));renderDecision(array(data.decisions));renderTables(array(data.trades),array(data.decisions));renderEvents(array(data.events));renderSettings(data.settings || {},data.usage || {});renderChart(array(data.equity));
   }
