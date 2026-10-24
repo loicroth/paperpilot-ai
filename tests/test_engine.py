@@ -163,7 +163,7 @@ async def test_one_batched_call_per_close_and_duplicate_survives_restart(rig):
     assert store.get('cash') < 900.
     new_ai = AIFixture()
     restarted = TradingEngine(store, env, market=market, ai=new_ai)
-    assert store.get('mode') == 'stopped'
+    assert store.get('mode') == 'running'  # Persist the user's autonomous run intent.
     restarted.started_ms = engine.started_ms
     restarted.health['market_ok'] = True
     restarted.quotes = engine.quotes

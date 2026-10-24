@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, logging, time, json
+import asyncio, logging, time, json, os
 from datetime import datetime, timezone
 from dataclasses import asdict
 from .config import Settings
@@ -24,19 +24,51 @@ class TradingEngine:
         self.scan = {'at': None, 'rows': [], 'selected': [], 'error': None}
         self._universe = []; self._universe_at = 0.; self._h1 = {}
         self.health=dict(status='DONNÉES INDISPONIBLES',message='Connexion aux données publiques…',market_ok=False,ai_ok=False,last_quote_at=None,last_analysis_at=store.get('last_analysis_at'))
-        self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None
+        self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None; self.verify_task=None
         self.started_ms=int(time.time()*1000); self.last_error=None; self.last_snapshot=0.; self.last_analysis_poll=0.; self.closing=False
         self.reconciled=False; self.provider_setup=False; self._settings_revision=0; self.critical_error=None
-        # Process restarts never silently resume autonomous entries.
-        self.store.set('mode','stopped')
-        self.store.event('Serveur démarré : analyses arrêtées, protection de toute position conservée.')
+        # Persist the user's run intent. New entries still require fresh, post-start
+        # candles, current data, reconciliation, API/risk checks and daily loss gate.
+        mode=self.store.get('mode','stopped')
+        if mode not in {'running','paused','stopped'}: mode='paused'
+        request=os.getenv('START_PAPER_ONCE','').strip()
+        if request and request!=self.store.get('consumed_start_request'):
+            with self.store.transaction():
+                self.store.set('consumed_start_request',request)
+                self.store.set('mode','running')
+            mode='running'
+        else: self.store.set('mode',mode)
+        self.last_diagnostic=0.
+        self.store.event('Serveur démarré : '+{'running':'reprise de la simulation demandée','paused':'pause conservée','stopped':'arrêt conservé'}[mode]+', protection des positions conservée.')
     def settings(self): return Settings.model_validate(self.store.get('settings'))
-    async def start(self): self.task=asyncio.create_task(self.run())
+    async def start(self):
+        self.task=asyncio.create_task(self.run())
+        if self.env.api_key: self.verify_task=asyncio.create_task(self.verify_ai())
+    async def verify_ai(self):
+        """One budgeted authentication/format check. Never a trading decision."""
+        cfg=self.settings();day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        reserve=20000
+        try:
+            if not self.store.reserve_usage(day,cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
+                raise ValueError('Budget API quotidien atteint : vérification IA non effectuée.')
+            self.ai.model=cfg.model
+            result=await self.ai.decide({'diagnostic_only':True,'symbols':[],'markets':{},'candidates':{},'positions':[],
+                'cash':self.store.get('cash'),'rules':cfg.model_dump()})
+            self.store.settle_usage(day,reserve,result.input_tokens+result.output_tokens)
+            if result.error: raise ValueError(result.error)
+            if result.decision.action!='WAIT': raise ValueError('Réponse de diagnostic IA non conforme.')
+            self.health.update(ai_ok=True,ai_error=None)
+            log.info('PAPER_AI_CHECK connexion et format structurés vérifiés ; aucun ordre ni décision de marché.')
+        except asyncio.CancelledError: raise
+        except Exception as exc:
+            self.health.update(ai_ok=False,ai_error=str(exc)[:300])
+            log.warning('PAPER_AI_CHECK %s',str(exc)[:300])
+        self.diagnostic()
     async def close(self):
         self.closing=True
-        for t in (self.analysis_task,self.task):
+        for t in (self.verify_task,self.analysis_task,self.task):
             if t: t.cancel()
-        await asyncio.gather(*[t for t in (self.analysis_task,self.task) if t],return_exceptions=True)
+        await asyncio.gather(*[t for t in (self.verify_task,self.analysis_task,self.task) if t],return_exceptions=True)
         await self.market.close()
         if hasattr(self.ai,'close'): await self.ai.close()
     def error(self,message):
@@ -54,7 +86,23 @@ class TradingEngine:
                 self.health['market_ok']=False
                 try: self.error(f'Moteur suspendu : {type(exc).__name__} : {str(exc)[:400]}')
                 except Exception: log.exception('Base indisponible : nouvelles entrées bloquées')
+            if time.monotonic()-self.last_diagnostic>=60:
+                try: self.diagnostic()
+                except Exception: log.warning('État opérationnel indisponible ; vérifier la base.')
+                self.last_diagnostic=time.monotonic()
             await asyncio.sleep(5)
+    def diagnostic(self):
+        cfg=self.settings()
+        provider=getattr(self.market,'capital',None)
+        state={'mode':self.store.get('mode'),'market_ok':self.health['market_ok'],
+            'ai_configured':bool(self.env.api_key),'ai_ok':self.health['ai_ok'],
+            'ai_error':self.health.get('ai_error'),'status':self.health['status'],
+            'message':self.health.get('message'),'last_analysis_at':self.health['last_analysis_at'],
+            'scan_count':len(self.scan['rows']),'candidate_count':len(self.scan['selected']),
+            'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,
+            'position_open':bool(self.store.position())}
+        log.info('PAPER_STATE %s',json.dumps(state,ensure_ascii=False))
+        return state
     def day_state(self,equity,now=None):
         day=(now or datetime.now(timezone.utc)).strftime('%Y-%m-%d')
         state=self.store.get('day_state')
@@ -251,7 +299,25 @@ class TradingEngine:
                 symbols = list(dict.fromkeys(crypto_symbols + cfd_symbols + ([held['symbol']] if held else [])))
                 if held: symbols=[held['symbol']]+[s for s in symbols if s!=held['symbol']]
 
-                raw = await asyncio.gather(*[market_context(s) for s in symbols], return_exceptions=True)
+                # Slow or unavailable symbols must not consume the entire fresh
+                # entry window and prevent ready markets from being evaluated.
+                tasks={symbol:asyncio.create_task(market_context(symbol)) for symbol in symbols}
+                try:
+                    remaining=max(0.,min(30.,(expected+43000-await self.market.server_time())/1000))
+                    done,pending=await asyncio.wait(list(tasks.values()),timeout=remaining)
+                    for task in pending: task.cancel()
+                    await asyncio.gather(*pending,return_exceptions=True)
+                    raw=[]
+                    for symbol in symbols:
+                        task=tasks[symbol]
+                        if task in pending: raw.append(MarketError('Délai de scan dépassé ; marché ignoré pour ce cycle.'))
+                        else:
+                            try: raw.append(task.result())
+                            except Exception as exc: raw.append(exc)
+                finally:
+                    outstanding=[t for t in tasks.values() if not t.done()]
+                    for task in outstanding: task.cancel()
+                    await asyncio.gather(*outstanding,return_exceptions=True)
                 rows=[]; valid=[]
                 for symbol, item in zip(symbols, raw):
                     if isinstance(item, BaseException):
@@ -264,6 +330,25 @@ class TradingEngine:
                 if not valid: raise MarketError('Aucun marché analysable sur ce cycle.')
                 ranked=sorted((r for r in valid if r[2]), key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
                 results=ranked[:cfg.ai_shortlist]
+                if cfg.cfd_enabled:
+                    # Volume is not comparable between OTC CFDs and exchange
+                    # crypto. Give each ready family a place, rotating ties.
+                    families={}
+                    for item in ranked:
+                        family=item[1]['instrument'].get('asset_class','unknown')
+                        families.setdefault(family,[]).append(item)
+                    order=list(families)
+                    if order:
+                        offset=(expected//300000)%len(order)
+                        order=order[offset:]+order[:offset]
+                        results=[]
+                        while order and len(results)<cfg.ai_shortlist:
+                            next_order=[]
+                            for family in order:
+                                if families[family] and len(results)<cfg.ai_shortlist:
+                                    results.append(families[family].pop(0))
+                                if families[family]: next_order.append(family)
+                            order=next_order
                 if held:
                     results=[r for r in valid if r[0]==held['symbol']]+[r for r in results if r[0]!=held['symbol']]
                 self.scan={'at':utcnow(),'rows':rows,'selected':[r[0] for r in results],'error':None}
@@ -323,6 +408,7 @@ class TradingEngine:
         async with self.lock:
             try:
                 if result.error: raise RiskRejected(result.error)
+                if expected<self.started_ms: raise RiskRejected('Cycle antérieur au dernier démarrage : décision annulée.')
                 if revision!=self._settings_revision: raise RiskRejected('Paramètres modifiés pendant l’analyse ; décision annulée.')
                 if self.store.get('mode')=='stopped': raise RiskRejected('Analyses arrêtées pendant l’appel IA.')
                 if not self.health['market_ok'] or not self.reconciled: raise RiskRejected('Données indisponibles ou réconciliation incomplète.')

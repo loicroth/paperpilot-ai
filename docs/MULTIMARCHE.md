@@ -26,7 +26,7 @@ Activer ensuite « Scanner CFD », enregistrer puis Démarrer. La connexion n'ac
 
 ## Reprise et persistance
 
-Migration SQLite v2 additive et transactionnelle, sauvegarde automatique avant migration d'une ancienne base dans DATA_DIR/backups. Données, solde, paramètres et positions conservés. Le serveur redémarre en pause. Les protections surveillent toute position existante dès que des cotations fraîches reviennent. Après une interruption, M1 est réconcilié prudemment (enveloppe bid/ask, priorité stop). Une fenêtre incomplète bloque les prises de profit favorables supposées ; les stops courants, appels de marge et limite de durée restent surveillés. Les périodes de fermeture peuvent empêcher une reconstitution complète. Ne pas revenir à l'ancienne version Spot avec une position CFD ouverte.
+Migration SQLite v2 additive et transactionnelle, sauvegarde automatique avant migration d'une ancienne base dans DATA_DIR/backups. Données, solde, paramètres et positions conservés. Le serveur conserve désormais le mode demandé (marche, pause ou arrêt) après redémarrage ; voir AUTONOMIE.md pour les vérifications et le démarrage ponctuel. Les protections surveillent toute position existante dès que des cotations fraîches reviennent. Après une interruption, M1 est réconcilié prudemment (enveloppe bid/ask, priorité stop). Une fenêtre incomplète bloque les prises de profit favorables supposées ; les stops courants, appels de marge et limite de durée restent surveillés. Les périodes de fermeture peuvent empêcher une reconstitution complète. Ne pas revenir à l'ancienne version Spot avec une position CFD ouverte.
 
 ## Vérifications réellement réalisées
 
