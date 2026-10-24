@@ -145,3 +145,9 @@ async def test_duplicate_json_keys_are_ambiguous_and_blocked():
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body))) as http:
         result = await AIClient("fixture-key", client=http).decide(context())
     assert result.decision.action == "WAIT" and result.error
+
+
+def test_buy_invalidation_at_entry_is_rejected_before_execution():
+    from app.ai import Decision
+    with pytest.raises(ValueError):
+        Decision(symbol='TRXUSDT',action='BUY',reason='fixture',entry=.3302,stop_loss=.3299,take_profit=.3307,invalidation=.3302,confirmation='fixture',risks=[],setup='reversal',confirmation_met=True)

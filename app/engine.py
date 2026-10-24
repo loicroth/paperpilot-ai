@@ -413,6 +413,27 @@ class TradingEngine:
             'positions':[p] if p else [],'cash':stats['cash'],'equity':stats['equity'],
             'daily_pnl':stats['equity']-day['start_equity'],'rules':cfg.model_dump(),
             'entries_paused':self.store.get('mode')!='running' or day['blocked']}
+        # Give the model explicit cost geometry. These are cost illustrations,
+        # never a new signal or permission to bypass a structural stop.
+        for symbol,data,_ in results:
+            if symbol.startswith('CAP:'): continue
+            from math import ceil
+            q=self.quotes[symbol]; rule=self.rules[symbol]
+            slip=cfg.slippage_bps/10000; factor=(1-slip)*(1-cfg.fee_rate)
+            fill=q.ask*(1+slip); examples=[]
+            for source,raw_stop in [('recent_low',data['m5']['recent_low']-.1*data['m5']['atr14']),('support',data['m5']['support']-.1*data['m5']['atr14'])]:
+                from .risk import floor_step
+                stop=floor_step(raw_stop,rule.tick_size)
+                distance=fill-stop;atr=data['m5']['atr14']
+                if not .35*atr<=distance<=4*atr: continue
+                loss=fill*(1+cfg.fee_rate)-stop*factor
+                required=(fill*(1+cfg.fee_rate)+cfg.min_rr*loss)/factor
+                target=ceil(required/rule.tick_size)*rule.tick_size
+                examples.append({'structural_reference':source,'stop':stop,'minimum_take_profit_for_net_rr':target,'net_rr_required':cfg.min_rr})
+            data['cost_geometry']={'currency':'USDT','estimated_entry_fill':fill,
+                'break_even_exit_before_exit_slippage':fill*(1+cfg.fee_rate)/factor,
+                'invalidation_constraint':'stop_loss <= invalidation < entry',
+                'examples_not_signals':examples,'note':'Un objectif inférieur au seuil net ne respecte pas le risque ; aucun exemple ne garantit un niveau structurel ou un gain.'}
         # Strip older nested AI histories so tokens stay bounded over many trades.
         if p: context['positions']=[{k:v for k,v in p.items() if k not in {'detail'}}]
         reserve=sum(len(v.encode('utf-8')) for v in (dumps(context),SYSTEM_PROMPT,dumps(Decision.model_json_schema())))+MAX_OUTPUT_TOKENS+1000 # Conservative byte upper bound and protocol allowance.
