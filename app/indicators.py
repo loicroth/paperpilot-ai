@@ -129,3 +129,16 @@ def short_candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[st
             last=bar(data['last']),previous=bar(data['previous']),candles=[bar(c) for c in data['candles']])
         return result
     return candidates(mirror(m5),mirror(h1),require_volume=require_volume)
+
+
+def long_refusals(m5: dict, h1: dict) -> list[str]:
+    """Explain existing gates without relaxing or replacing the strategy."""
+    last=m5['last'];atr=m5['atr14'];reasons=[]
+    if atr<=0 or not .03<=m5['atr_pct']<=3:reasons.append('ATR hors plage')
+    if last['high']-last['low']>2.5*atr or last['close']-m5['ema21']>2.5*atr:reasons.append('Bougie ou prix trop étendu')
+    if not 40<=m5['rsi14']<=76:reasons.append('RSI hors plage 40–76')
+    if last['close']<=last['open']:reasons.append('Bougie M5 non haussière')
+    if h1['last']['close']<h1['ema21']:reasons.append('H1 sous EMA21 : achat non autorisé')
+    if h1['ema21']<h1['ema21_previous']:reasons.append('EMA21 H1 descendante')
+    if not reasons:reasons.append('Cassure, retest, reprise ou retournement confirmé absent ; volume éventuellement insuffisant')
+    return reasons

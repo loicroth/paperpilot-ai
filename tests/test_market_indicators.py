@@ -170,3 +170,13 @@ async def test_live_binance_market_data():
             assert rules[symbol].step_size > 0
     finally:
         await api.close()
+
+
+def test_long_refusal_explains_bearish_h1_without_authorizing_trade():
+    from app.indicators import long_refusals,candidates
+    m={'last':{'open':100.,'close':100.2,'high':100.4,'low':99.9},'previous':{'close':100.},'atr14':1.,'atr_pct':1.,'ema21':100.,'rsi14':55.,'volume_ratio':1.5}
+    h={'last':{'close':99.},'ema21':100.,'ema21_previous':100.2}
+    reasons=long_refusals(m,h)
+    assert any('H1 sous EMA21' in x for x in reasons)
+    assert any('descendante' in x for x in reasons)
+    assert candidates(m,h)==[]

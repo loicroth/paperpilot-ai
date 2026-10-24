@@ -5,7 +5,7 @@ from dataclasses import asdict
 from .config import Settings
 from .market import BinanceClient, MarketError
 from .multimarket import MultiMarket
-from .indicators import snapshot, candidates, short_candidates
+from .indicators import snapshot, candidates, short_candidates, long_refusals
 from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS
 from .risk import RiskEngine, RiskRejected
 from .execution import PaperExecutionEngine
@@ -39,6 +39,8 @@ class TradingEngine:
             mode='running'
         else: self.store.set('mode',mode)
         self.last_diagnostic=0.
+        try: self.history_diagnostic()
+        except Exception: log.warning('Rapport historique indisponible ; démarrage conservé.')
         self.store.event('Serveur démarré : '+{'running':'reprise de la simulation demandée','paused':'pause conservée','stopped':'arrêt conservé'}[mode]+', protection des positions conservée.')
     def settings(self): return Settings.model_validate(self.store.get('settings'))
     async def start(self):
@@ -91,6 +93,29 @@ class TradingEngine:
                 except Exception: log.warning('État opérationnel indisponible ; vérifier la base.')
                 self.last_diagnostic=time.monotonic()
             await asyncio.sleep(5)
+    def history_diagnostic(self):
+        """Private operational report, no credentials, balances or raw AI context."""
+        from collections import Counter
+        since=datetime.fromtimestamp(time.time()-12*3600,timezone.utc).isoformat(timespec='milliseconds')
+        rows=self.store.rows('SELECT at,symbol,action,reason,rejection,detail FROM decisions WHERE at>=? ORDER BY id DESC',(since,))
+        actions=Counter(row['action'] for row in rows)
+        rejections=Counter(row['rejection'] for row in rows if row['rejection'])
+        selected=[]
+        for row in rows:
+            try: detail=json.loads(row['detail']) if isinstance(row['detail'],str) else row['detail']
+            except Exception: continue
+            context=detail.get('context',{}) if isinstance(detail,dict) else {}
+            proposals=context.get('candidates',{}) if isinstance(context,dict) else {}
+            if not isinstance(proposals,dict): continue
+            admitted={symbol:setups for symbol,setups in proposals.items() if setups}
+            if admitted and len(selected)<8:
+                selected.append({'at':row['at'],'symbol':row['symbol'],'action':row['action'],
+                    'reason':row['reason'],'rejection':row['rejection'],'admitted':admitted,
+                    'proposal':detail.get('proposal'),'usage':detail.get('usage')})
+        report={'since_utc':since,'decisions':len(rows),'actions':dict(actions),
+            'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected}
+        log.info('PAPER_HISTORY_REPORT %s',json.dumps(report,ensure_ascii=False))
+        return report
     def diagnostic(self):
         cfg=self.settings()
         provider=getattr(self.market,'capital',None)
@@ -283,6 +308,7 @@ class TradingEngine:
                 directions = (['BUY'] if setups else []) + (['SHORT'] if shorts else [])
                 return symbol,{'m5':a,'h1':b,'quote':asdict(q),'directions':directions,
                     'direction_candidates':{'BUY':setups,'SHORT':shorts},
+                    'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else '; '.join(long_refusals(a,b)) if not symbol.startswith('CAP:') and not setups else None),
                     'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'}},list(dict.fromkeys(setups+shorts))
         try:
             if expanded:
@@ -326,7 +352,7 @@ class TradingEngine:
                     else:
                         valid.append(item)
                         rows.append({'symbol':symbol,**item[1]['instrument'],'status':'CANDIDAT' if item[2] else 'ATTENTE',
-                            'reason':', '.join(item[2]) or 'Critères techniques, spread ou volatilité non réunis.'})
+                            'reason':', '.join(item[2]) or item[1].get('filter_reason') or 'Critères techniques, spread ou volatilité non réunis.'})
                 if not valid: raise MarketError('Aucun marché analysable sur ce cycle.')
                 ranked=sorted((r for r in valid if r[2]), key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
                 results=ranked[:cfg.ai_shortlist]

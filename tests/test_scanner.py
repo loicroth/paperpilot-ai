@@ -87,3 +87,29 @@ def test_config_persistence_bounds(tmp_path):
     db.set('settings',Settings(auto_scanner=True,scanner_limit=40).model_dump());db.close()
     db=Store(path);assert Settings.model_validate(db.get('settings')).auto_scanner;db.close()
     with pytest.raises(ValueError): Settings(scanner_limit=41)
+
+@pytest.mark.asyncio
+async def test_discovery_freshness_uses_clock_after_network_fetches(monkeypatch):
+    client=BinanceClient();clock=[1800000000000]
+    async def time_now():return clock[0]
+    async def get(endpoint,params=None):
+        if endpoint=='exchangeInfo':
+            clock[0]+=3000
+            return {'symbols':[dict(symbol='BTCUSDT',baseAsset='BTC',quoteAsset='USDT',status='TRADING',isSpotTradingAllowed=True)]}
+        clock[0]+=1000
+        return [{'symbol':'BTCUSDT','quoteVolume':'9000000','closeTime':clock[0]-100}]
+    monkeypatch.setattr(client,'server_time',time_now);monkeypatch.setattr(client,'_get',get)
+    assert await client.liquid_symbols()==['BTCUSDT']
+    await client.close()
+
+@pytest.mark.asyncio
+async def test_discovery_tolerates_bounded_clock_skew_but_not_future_or_stale(monkeypatch):
+    client=BinanceClient();now=1800000000000
+    async def clock():return now
+    names=['BTC','ETH','SOL']
+    async def get(endpoint,params=None):
+        if endpoint=='exchangeInfo':return {'symbols':[dict(symbol=s+'USDT',baseAsset=s,quoteAsset='USDT',status='TRADING',isSpotTradingAllowed=True) for s in names]}
+        return [dict(symbol=s+'USDT',quoteVolume='9000000',closeTime=now-age) for s,age in zip(names,[-1500,-6000,120001])]
+    monkeypatch.setattr(client,'server_time',clock);monkeypatch.setattr(client,'_get',get)
+    assert await client.liquid_symbols()==['BTCUSDT']
+    await client.close()

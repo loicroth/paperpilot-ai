@@ -160,9 +160,11 @@ class BinanceClient:
 
     async def liquid_symbols(self, limit: int = 30) -> list[str]:
         """Rank active USDT Spot markets by real 24h turnover; no synthetic instruments."""
-        now = await self.server_time()
         info = await self._get("exchangeInfo")
         tickers = await self._get("ticker/24hr", {"type": "MINI"})
+        # Measure freshness AFTER the network fetches. Otherwise recent tickers
+        # can appear future-dated compared to a clock read before metadata I/O.
+        now = await self.server_time()
         if not isinstance(info, dict) or not isinstance(info.get("symbols"), list) or not isinstance(tickers, list):
             raise MarketError("Liste des marchés indisponible.")
         excluded = {"USDC", "USDP", "TUSD", "FDUSD", "DAI", "USDE", "USD1", "BUSD", "AEUR", "EURI", "EUR", "PAXG", "XAUT"}
@@ -182,7 +184,7 @@ class BinanceClient:
                 symbol = row["symbol"]
                 self._validate_symbol(symbol)
                 turnover = _positive(row["quoteVolume"], True)
-                if symbol in allowed and turnover >= 5_000_000 and 0 <= now - int(row["closeTime"]) <= 120000:
+                if symbol in allowed and turnover >= 5_000_000 and -5000 <= now - int(row["closeTime"]) <= 120000:
                     ranked.append((turnover, symbol))
             except (KeyError, TypeError, ValueError, MarketError):
                 continue
