@@ -214,15 +214,17 @@ class BinanceClient:
         self._validate_symbol(symbol)
         await self.server_time()
         data = await self._get("ticker/bookTicker", {"symbol": symbol})
+        received_ms = int(time.time() * 1000)
         try:
             if data["symbol"] != symbol:
                 raise MarketError("Symbole de cotation incohérent.")
             bid, ask = _positive(data["bidPrice"]), _positive(data["askPrice"])
             if ask < bid or ask / bid > 1.05:
                 raise MarketError("Cotation bid/ask incohérente ou spread supérieur à 5 %.")
-            # bookTicker REST contains no event time. Receipt time, not an invented exchange timestamp.
-            timestamp = await self.server_time()
-            return Quote(symbol, bid, ask, timestamp)
+            # bookTicker REST has no event time. Use the actual local receipt
+            # clock, also used by execution freshness checks. The estimated
+            # exchange clock may be ahead and is only for candle boundaries.
+            return Quote(symbol, bid, ask, received_ms)
         except (KeyError, TypeError, ValueError):
             raise MarketError("Cotation Binance incomplète.") from None
 

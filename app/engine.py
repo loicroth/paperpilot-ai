@@ -470,18 +470,20 @@ class TradingEngine:
                 # Fresh quote AFTER the potentially slow AI call. Do not execute on its input price.
                 if decision.action in {'BUY','SHORT','SELL'}:
                     if decision.symbol not in context['markets']: raise RiskRejected('Marché absent de la sélection analysée.')
-                    q=await self.market.quote(decision.symbol); self.quotes[decision.symbol]=q
-                    if q.time_ms-expected>65000: raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
-                    stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
                     if decision.action in {'BUY','SHORT'}:
                         if decision.symbol.startswith('CAP:') and self.provider_setup: raise RiskRejected('Connexion de données en cours de modification.')
                         if decision.action not in context['directions'].get(decision.symbol,[]): raise RiskRejected('Direction non admissible selon le scanner.')
                         if decision.setup not in context['direction_candidates'].get(decision.symbol,{}).get(decision.action,[]): raise RiskRejected('Configuration non admissible pour cette direction.')
+                        # Finish metadata I/O before the final executable quote.
                         self.rules.update(await self.market.rules([decision.symbol]))
+                    q=await self.market.quote(decision.symbol); self.quotes[decision.symbol]=q
+                    if q.time_ms-expected>65000: raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
+                    stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
+                    if decision.action in {'BUY','SHORT'}:
                         remaining=max(0,day['start_equity']*cfg.daily_loss_pct/100+(stats['equity']-day['start_equity']))
                         sized_cfg=cfg.model_copy(update={'risk_pct':min(cfg.risk_pct,remaining/max(stats['equity'],1e-12)*100)})
                         plan=RiskEngine.plan(decision,q,self.rules[decision.symbol],sized_cfg,stats['cash'],stats['equity'],p,
-                            paused=self.store.get('mode')!='running',day_blocked=day['blocked'],atr=context['markets'][decision.symbol]['m5']['atr14'],now_ms=q.time_ms)
+                            paused=self.store.get('mode')!='running',day_blocked=day['blocked'],atr=context['markets'][decision.symbol]['m5']['atr14'],now_ms=int(time.time()*1000))
                         self.paper.buy(plan,q,key,decision,cfg,{**detail,'plan':asdict(plan)})
                     else:
                         if not p or p['symbol']!=decision.symbol: raise RiskRejected('SELL sans actif détenu interdit.')
@@ -492,6 +494,8 @@ class TradingEngine:
             except (ValueError,MarketError) as exc: rejection=str(exc)
             self.store.decision(decision,rejection,detail)
             if decision.action in {'BUY','SHORT','SELL'}:
+                reviewed_quote=self.quotes.get(decision.symbol)
                 log.info('PAPER_ORDER_REVIEW %s',json.dumps({'at':self.store.get('last_analysis_at'),
-                    'symbol':decision.symbol,'action':decision.action,'rejection':rejection,'signal_id':key},ensure_ascii=False))
+                    'symbol':decision.symbol,'action':decision.action,'rejection':rejection,'signal_id':key,
+                    'quote_age_ms':int(time.time()*1000)-reviewed_quote.time_ms if reviewed_quote else None},ensure_ascii=False))
             self.health['last_analysis_at']=self.store.get('last_analysis_at')

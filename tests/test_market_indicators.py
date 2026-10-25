@@ -66,8 +66,10 @@ def test_deterministic_breakout_and_extension_rejection():
 
 
 @pytest.mark.asyncio
-async def test_binance_time_quote_and_closed_klines():
+async def test_binance_time_quote_and_closed_klines(monkeypatch):
     now = 1800000300000
+    local_receipt = now - 500
+    monkeypatch.setattr('app.market.time.time',lambda:local_receipt/1000)
     def handler(request):
         if request.url.path.endswith('/time'):
             return httpx.Response(200, json={'serverTime':now})
@@ -80,7 +82,9 @@ async def test_binance_time_quote_and_closed_klines():
     api, raw = client_for(handler)
     quote = await api.quote('BTCUSDT')
     assert quote.bid == 100 and quote.ask == 100.1
-    assert abs(quote.time_ms-now) < 1000
+    assert quote.time_ms == local_receipt
+    # Exchange time still governs candle closure; receipt time governs quote age.
+    assert 0 <= (await api.server_time())-now < 1000
     rows = await api.candles('BTCUSDT','5m')
     assert len(rows) == 1 and rows[0].close == 101
     await raw.aclose()

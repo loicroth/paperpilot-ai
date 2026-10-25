@@ -335,3 +335,82 @@ async def test_structured_ai_adapter_integrates_with_real_indicator_context(rig)
     assert store.position()['symbol'] == 'BTCUSDT'
     decision = store.rows('SELECT * FROM decisions')[0]
     assert decision['action'] == 'BUY' and decision['rejection'] is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_delay_precedes_fresh_quote_and_risk_plan(rig,monkeypatch):
+    """16 s of metadata I/O must not age the final executable quote."""
+    engine,store,market,ai,_=rig
+    monkeypatch.setattr('app.engine.candidates',lambda m5,h1:['breakout'])
+    monkeypatch.setattr('app.engine.time.time',lambda:market.now/1000)
+    original_rules,original_quote,original_buy=market.rules,market.quote,engine.paper.buy
+    stages=[]
+    async def rules(symbols):
+        if ai.contexts:
+            stages.append('rules')
+            market.now+=16000
+        return await original_rules(symbols)
+    async def quote(symbol):
+        if ai.contexts: stages.append('quote')
+        return await original_quote(symbol)
+    def buy(*args,**kwargs):
+        stages.append('buy')
+        return original_buy(*args,**kwargs)
+    monkeypatch.setattr(market,'rules',rules)
+    monkeypatch.setattr(market,'quote',quote)
+    monkeypatch.setattr(engine.paper,'buy',buy)
+    await engine._analyze()
+    assert stages==['rules','quote','buy']
+    assert store.position() is not None
+    assert store.position()['last_market_at']==market.now
+    assert store.rows('SELECT rejection FROM decisions')[-1]['rejection'] is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_delay_cannot_bypass_65_second_entry_window(rig,monkeypatch):
+    engine,store,market,ai,_=rig
+    monkeypatch.setattr('app.engine.candidates',lambda m5,h1:['breakout'])
+    monkeypatch.setattr('app.engine.time.time',lambda:market.now/1000)
+    original=market.rules
+    async def rules(symbols):
+        if ai.contexts: market.now+=61000
+        return await original(symbols)
+    monkeypatch.setattr(market,'rules',rules)
+    await engine._analyze()
+    assert store.position() is None
+    assert '>65 s' in store.rows('SELECT rejection FROM decisions')[-1]['rejection']
+
+
+@pytest.mark.asyncio
+async def test_metadata_delay_refetches_quote_and_revalidates_price_drift(rig,monkeypatch):
+    engine,store,market,ai,_=rig
+    monkeypatch.setattr('app.engine.candidates',lambda m5,h1:['breakout'])
+    monkeypatch.setattr('app.engine.time.time',lambda:market.now/1000)
+    original=market.rules
+    async def rules(symbols):
+        if ai.contexts:
+            market.now+=16000
+            market.price=100.5
+        return await original(symbols)
+    monkeypatch.setattr(market,'rules',rules)
+    await engine._analyze()
+    assert store.position() is None
+    assert 'Cours déplacé' in store.rows('SELECT rejection FROM decisions')[-1]['rejection']
+
+
+@pytest.mark.asyncio
+async def test_risk_rechecks_quote_age_against_local_clock_before_execution(rig,monkeypatch):
+    """A malformed future quote must fail risk validation, not just the final executor."""
+    engine,store,market,ai,_=rig
+    monkeypatch.setattr('app.engine.candidates',lambda m5,h1:['breakout'])
+    original=market.quote
+    async def future_quote(symbol):
+        q=await original(symbol)
+        return Quote(q.symbol,q.bid,q.ask,q.time_ms+500)
+    def forbidden_buy(*args,**kwargs):
+        pytest.fail('Risk must reject a future quote before the executor is called')
+    monkeypatch.setattr(market,'quote',future_quote)
+    monkeypatch.setattr(engine.paper,'buy',forbidden_buy)
+    await engine._analyze()
+    assert store.position() is None
+    assert 'horodatage futur' in store.rows('SELECT rejection FROM decisions')[-1]['rejection']
