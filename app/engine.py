@@ -50,6 +50,7 @@ class TradingEngine:
         """One budgeted authentication/format check. Never a trading decision."""
         cfg=self.settings();day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
         reserve=20000
+        error_kind=None
         try:
             if not self.store.reserve_usage(day,cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
                 raise ValueError('Budget API quotidien atteint : vérification IA non effectuée.')
@@ -57,13 +58,15 @@ class TradingEngine:
             result=await self.ai.decide({'diagnostic_only':True,'symbols':[],'markets':{},'candidates':{},'positions':[],
                 'cash':self.store.get('cash'),'rules':cfg.model_dump()})
             self.store.settle_usage(day,reserve,result.input_tokens+result.output_tokens)
-            if result.error: raise ValueError(result.error)
+            if result.error:
+                error_kind=getattr(result,'error_kind',None)
+                raise ValueError(result.error)
             if result.decision.action!='WAIT': raise ValueError('Réponse de diagnostic IA non conforme.')
-            self.health.update(ai_ok=True,ai_error=None)
+            self.health.update(ai_ok=True,ai_error=None,ai_error_kind=None)
             log.info('PAPER_AI_CHECK connexion et format structurés vérifiés ; aucun ordre ni décision de marché.')
         except asyncio.CancelledError: raise
         except Exception as exc:
-            self.health.update(ai_ok=False,ai_error=str(exc)[:300])
+            self.health.update(ai_ok=False,ai_error=str(exc)[:300],ai_error_kind=error_kind or 'operational')
             log.warning('PAPER_AI_CHECK %s',str(exc)[:300])
         self.diagnostic()
     async def close(self):
@@ -116,7 +119,8 @@ class TradingEngine:
             if admitted and len(selected)<8:
                 selected.append({'at':row['at'],'symbol':row['symbol'],'action':row['action'],
                     'reason':row['reason'],'rejection':row['rejection'],'admitted':admitted,
-                    'proposal':detail.get('proposal'),'usage':detail.get('usage')})
+                    'proposal':detail.get('proposal'),'usage':detail.get('usage'),
+                    'ai_diagnostic':detail.get('ai_diagnostic')})
         report={'since_utc':since,'decisions':len(rows),'actions':dict(actions),
             'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected,
             'order_decisions':orders,
@@ -129,7 +133,7 @@ class TradingEngine:
         provider=getattr(self.market,'capital',None)
         state={'mode':self.store.get('mode'),'market_ok':self.health['market_ok'],
             'ai_configured':bool(self.env.api_key),'ai_ok':self.health['ai_ok'],
-            'ai_error':self.health.get('ai_error'),'status':self.health['status'],
+            'ai_error':self.health.get('ai_error'),'ai_error_kind':self.health.get('ai_error_kind'),'status':self.health['status'],
             'message':self.health.get('message'),'last_analysis_at':self.health['last_analysis_at'],
             'scan_count':len(self.scan['rows']),'candidate_count':len(self.scan['selected']),
             'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,
@@ -254,7 +258,14 @@ class TradingEngine:
             elif ds['blocked']:
                 self.health.update(status='PAUSE',message='Limite de perte journalière atteinte. Nouvelles entrées bloquées jusqu’à demain UTC.')
             elif self.health.get('ai_error'):
-                self.health.update(status='ERREUR',message=self.health['ai_error'],ai_ok=False)
+                if self.health.get('ai_error_kind')=='invalid_decision':
+                    run_message={'running':'Le scanner continue ; une nouvelle réponse valide est nécessaire pour exécuter un ordre.',
+                        'paused':'Entrées en pause ; protection des positions surveillée.',
+                        'stopped':'Analyses arrêtées ; protection des positions surveillée.'}[mode]
+                    self.health.update(status='ACTIVE · RÉPONSE IA REJETÉE' if mode=='running' else 'PAUSE',
+                        message=f"Dernière réponse IA rejetée : {self.health['ai_error']} {run_message}",ai_ok=False)
+                else:
+                    self.health.update(status='ERREUR',message=self.health['ai_error'],ai_ok=False)
             elif not self.health['ai_ok'] and mode=='running':
                 self.health.update(status='ACTIVE',message='Scanner actif ; IA non encore vérifiée. Aucun achat avant une réponse valide.')
             else:
@@ -458,8 +469,14 @@ class TradingEngine:
         rejection=result.error; decision=result.decision
         detail={'context':context,'proposal':decision.model_dump(),'api_error':result.error,'model':cfg.model,
                 'usage':{'input_tokens':result.input_tokens,'output_tokens':result.output_tokens}}
-        self.health.update(ai_ok=not bool(result.error),ai_error=result.error)
-        if result.error: self.store.event(result.error,'error')
+        error_kind=getattr(result,'error_kind',None)
+        diagnostic=getattr(result,'diagnostic',None)
+        if diagnostic: detail['ai_diagnostic']=diagnostic
+        self.health.update(ai_ok=not bool(result.error),ai_error=result.error,ai_error_kind=error_kind)
+        if result.error:
+            self.store.event(result.error,'warning' if error_kind=='invalid_decision' else 'error')
+            log.warning('PAPER_AI_REJECTION %s',json.dumps({'at':utcnow(),'closed_candle_ms':expected,
+                'error_kind':error_kind,'diagnostic':diagnostic},ensure_ascii=False))
         async with self.lock:
             try:
                 if result.error: raise RiskRejected(result.error)

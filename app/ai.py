@@ -77,6 +77,72 @@ class AIResult:
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    error_kind: str | None = None
+    diagnostic: dict | None = None
+
+
+def _failure(kind, stage, code, reason, input_tokens=0, output_tokens=0, issues=None):
+    """Only application-owned text may cross this diagnostic boundary."""
+    message = f"Décision OpenAI invalide : {reason} WAIT." if kind == "invalid_decision" else reason
+    diagnostic = {"stage": stage, "code": code, "reason": reason}
+    if issues is not None:
+        diagnostic["issues"] = issues
+    return AIResult(wait(message), message, input_tokens, output_tokens, kind, diagnostic)
+
+
+_COHERENCE_ERRORS = {
+    "Valeur vide": ("blank_value", "Texte vide interdit."),
+    "Risques invalides": ("invalid_risks", "Liste des risques invalide."),
+    "Niveaux non positifs ou non finis": ("invalid_levels", "Prix non positif ou non fini."),
+    "BUY sans niveaux complets": ("buy_levels_missing", "Achat proposé sans tous les niveaux requis."),
+    "Niveaux BUY contradictoires": ("buy_levels_inconsistent", "Achat : stop, entrée et objectif dans un ordre incohérent."),
+    "Invalidation BUY requise entre le stop inclus et l’entrée exclue": ("buy_invalidation", "Achat : invalidation requise entre le stop inclus et l’entrée exclue."),
+    "BUY non confirmé": ("buy_unconfirmed", "Achat sans configuration confirmée."),
+    "Niveaux SHORT contradictoires": ("short_levels_inconsistent", "Vente à découvert : niveaux absents ou incohérents."),
+    "SHORT non confirmé ou invalidation incohérente": ("short_unconfirmed_or_invalidation", "Vente à découvert : confirmation absente ou invalidation incohérente."),
+    "WAIT/HOLD ne doit pas proposer de nouveaux niveaux": ("wait_hold_levels", "WAIT ou HOLD ne peut pas proposer de nouveaux niveaux."),
+    "WAIT contradictoire": ("wait_inconsistent", "WAIT doit avoir une configuration none et aucune confirmation."),
+}
+_FIELD_ERRORS = {
+    "missing": "Champ requis absent.", "extra_forbidden": "Champ supplémentaire interdit.",
+    "string_type": "Texte requis.", "string_too_short": "Texte trop court.",
+    "string_too_long": "Texte trop long.", "literal_error": "Valeur hors des choix autorisés.",
+    "float_type": "Prix numérique requis.", "finite_number": "Nombre non fini interdit.",
+    "bool_type": "Booléen requis.", "list_type": "Liste requise.",
+    "too_long": "Liste trop longue.", "model_type": "Objet de décision requis.",
+    "value_error": "Valeur incohérente.",
+}
+_CONTEXT_ERRORS = {
+    "Symbole absent des marchés surveillés": ("unknown_symbol", "Symbole absent des marchés analysés."),
+    "Symbole WAIT inconnu": ("unknown_wait_symbol", "WAIT porte sur un symbole non fourni."),
+    "Vente ou conservation d'un actif non détenu": ("position_not_held", "SELL ou HOLD proposé sans position détenue sur ce marché."),
+    "SHORT interdit sur ce marché": ("short_forbidden", "Vente à découvert interdite sur ce marché."),
+    "Une position est déjà ouverte": ("position_already_open", "Nouvelle entrée interdite : une position est déjà ouverte."),
+    "Configuration non admissible selon les filtres déterministes": ("setup_not_admitted", "Configuration absente des candidats du scanner."),
+    "Configuration incompatible avec la direction proposée": ("setup_direction_mismatch", "Configuration incompatible avec le sens proposé."),
+    "Direction absente des configurations admissibles": ("direction_not_admitted", "Sens proposé absent des directions autorisées."),
+}
+
+
+def _validation_issues(exc):
+    issues = []
+    for error in exc.errors(include_input=False, include_context=False, include_url=False)[:8]:
+        loc = error.get("loc", ())
+        field = loc[0] if loc and loc[0] in Decision.model_fields else "$model" if not loc else "$schema"
+        kind = error.get("type")
+        code, reason = kind if kind in _FIELD_ERRORS else "validation_error", _FIELD_ERRORS.get(kind, "Validation du schéma refusée.")
+        if kind == "value_error":
+            message = error.get("msg", "")
+            if isinstance(message, str):
+                code, reason = _COHERENCE_ERRORS.get(message.removeprefix("Value error, "), (code, reason))
+        issues.append({"field": field, "code": code, "reason": reason})
+    return issues or [{"field": "$schema", "code": "validation_error", "reason": "Validation du schéma refusée."}]
+
+
+class _DecisionRejected(ValueError):
+    def __init__(self, stage, code, reason):
+        self.stage, self.code, self.reason = stage, code, reason
+        super().__init__(reason)
 
 
 def _symbols(context: dict) -> set[str]:
@@ -163,14 +229,16 @@ class AIClient:
     async def decide(self, context: dict[str, Any]) -> AIResult:
         if not self.api_key:
             message = "IA non configurée : clé OpenAI absente. Aucune transaction."
-            return AIResult(wait(message), message)
+            return _failure("configuration", "configuration", "missing_key", message)
         if not self.model:
             message = "IA non configurée : modèle OpenAI absent."
-            return AIResult(wait(message), message)
+            return _failure("configuration", "configuration", "missing_model", message)
         input_tokens = output_tokens = 0
+        stage = "input"
         try:
             serialized = json.dumps(context, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             schema = Decision.model_json_schema()
+            stage = "request"
             response = await self.client.post(API_URL,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json={"model": self.model, "store": False, "instructions": SYSTEM_PROMPT,
@@ -180,37 +248,74 @@ class AIClient:
                       "max_output_tokens": self.max_output_tokens}, timeout=35.0)
             if response.status_code in {401, 403}:
                 message = "OpenAI : authentification refusée ou accès au modèle interdit. Vérifiez la clé et les permissions."
-                return AIResult(wait(message), message)
+                return _failure("authentication", "http", "authentication_or_access_denied", message)
             if response.status_code == 429:
-                message = "OpenAI : quota épuisé ou limite de requêtes atteinte. Vérifiez la facturation API."
-                return AIResult(wait(message), message)
+                message = "OpenAI : requête refusée (HTTP 429). Limite de requêtes ou quota API à vérifier."
+                return _failure("limits", "http", "request_limited", message)
             if not response.is_success:
                 message = f"OpenAI : erreur HTTP {response.status_code}. Aucune opération."
-                return AIResult(wait(message), message)
+                return _failure("http", "http", "http_error", message)
+            stage = "response_json"
             body = response.json()
+            stage = "response_envelope"
             usage = body.get("usage", {}) or {}
+            stage = "usage"
             input_tokens = max(0, int(usage.get("input_tokens", 0)))
             output_tokens = max(0, int(usage.get("output_tokens", 0)))
+            stage = "response_envelope"
             if body.get("status") != "completed":
-                raise ValueError("Réponse OpenAI incomplète")
+                details = body.get("incomplete_details")
+                reason = details.get("reason") if isinstance(details, dict) else None
+                if reason == "max_output_tokens":
+                    raise _DecisionRejected(stage, "response_output_limit", "Réponse interrompue : limite de sortie atteinte.")
+                if reason == "content_filter":
+                    raise _DecisionRejected(stage, "response_filtered", "Réponse interrompue par le filtrage du fournisseur.")
+                raise _DecisionRejected(stage, "response_incomplete", "Réponse OpenAI non terminée.")
             parts = []
             for item in body.get("output", []):
                 if item.get("type") == "message":
                     for part in item.get("content", []):
                         if part.get("type") == "refusal":
-                            raise ValueError("Réponse refusée par OpenAI")
+                            raise _DecisionRejected(stage, "response_refused", "Le fournisseur a refusé de produire une décision.")
                         if part.get("type") == "output_text":
                             parts.append(part.get("text", ""))
-            if len(parts) != 1 or not isinstance(parts[0], str):
-                raise ValueError("Réponse OpenAI absente ou ambiguë")
+            if not parts:
+                raise _DecisionRejected(stage, "missing_output", "Aucune décision reçue.")
+            if len(parts) != 1:
+                raise _DecisionRejected(stage, "ambiguous_output", "Plusieurs décisions reçues : réponse ambiguë.")
+            if not isinstance(parts[0], str):
+                raise _DecisionRejected(stage, "invalid_output_type", "Format du texte de décision invalide.")
+            stage = "output_json"
             parsed = json.loads(parts[0], object_pairs_hook=_unique_object)
+            stage = "decision_schema"
             decision = Decision.model_validate(parsed, strict=True)
-            validate_context(decision, context)
+            stage = "decision_context"
+            try:
+                validate_context(decision, context)
+            except ValueError as exc:
+                message = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else None
+                code, reason = _CONTEXT_ERRORS.get(message, ("context_validation", "Décision incompatible avec le contexte analysé."))
+                raise _DecisionRejected(stage, code, reason) from None
             return AIResult(decision, None, input_tokens, output_tokens)
         except httpx.TimeoutException:
             message = "OpenAI indisponible : délai dépassé. Aucune opération."
+            return _failure("network", "request", "timeout", message, input_tokens, output_tokens)
         except httpx.RequestError:
             message = "OpenAI indisponible : erreur réseau. Aucune opération."
-        except (ValidationError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
-            message = "Décision OpenAI invalide, contradictoire ou incomplète : WAIT."
-        return AIResult(wait(message), message, input_tokens, output_tokens)
+            return _failure("network", "request", "network_error", message, input_tokens, output_tokens)
+        except _DecisionRejected as exc:
+            return _failure("invalid_decision", exc.stage, exc.code, exc.reason, input_tokens, output_tokens)
+        except ValidationError as exc:
+            issues = _validation_issues(exc)
+            first = issues[0]
+            reason = first['reason'] if first['field'].startswith('$') else f"Champ {first['field']} : {first['reason']}"
+            return _failure("invalid_decision", "decision_schema", first['code'], reason, input_tokens, output_tokens, issues)
+        except json.JSONDecodeError:
+            reason = "JSON de décision illisible." if stage == "output_json" else "Enveloppe de réponse JSON illisible."
+            return _failure("invalid_decision", stage, "invalid_json", reason, input_tokens, output_tokens)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            if stage == "input":
+                return _failure("invalid_input", stage, "invalid_context_input", "Contexte de demande invalide : aucun appel OpenAI effectué.")
+            if stage == "output_json" and exc.args == ("Clé JSON dupliquée",):
+                return _failure("invalid_decision", stage, "duplicate_json_key", "Clé JSON dupliquée : décision ambiguë.", input_tokens, output_tokens)
+            return _failure("invalid_decision", stage, "malformed_response", "Structure de réponse OpenAI inexploitable.", input_tokens, output_tokens)

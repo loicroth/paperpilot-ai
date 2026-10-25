@@ -82,3 +82,54 @@ async def test_failed_startup_ai_check_never_opens_position(rig):
     await bot.verify_ai()
     assert bot.health['ai_ok'] is False and 'Quota' in bot.health['ai_error']
     assert db.position() is None and not db.rows('SELECT * FROM decisions')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['running','paused','stopped'])
+async def test_rejected_response_keeps_run_intent_without_claiming_ai_is_valid(rig,mode):
+    bot,db,market,ai,_=rig
+    db.set('mode',mode)
+    bot.health.update(ai_ok=False,ai_error='Niveaux BUY contradictoires.',ai_error_kind='invalid_decision')
+    await bot.tick()
+    assert db.get('mode')==mode and bot.health['ai_ok'] is False
+    assert bot.health['status']==('ACTIVE · RÉPONSE IA REJETÉE' if mode=='running' else 'PAUSE')
+    assert 'Niveaux BUY' in bot.health['message']
+    assert db.position() is None
+
+
+@pytest.mark.asyncio
+async def test_authentication_failure_remains_an_error(rig):
+    bot,db,market,ai,_=rig
+    bot.health.update(ai_ok=False,ai_error='Authentification refusée.',ai_error_kind='authentication')
+    await bot.tick()
+    assert bot.health['status']=='ERREUR' and bot.health['ai_ok'] is False
+    assert db.position() is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_cycle_is_logged_without_trade_and_next_valid_cycle_can_execute(rig,monkeypatch):
+    from app.ai import AIResult,wait
+    from test_engine import buy_decision
+    bot,db,market,ai,_=rig
+    monkeypatch.setattr('app.engine.candidates',lambda *args,**kwargs:['breakout'])
+    monkeypatch.setattr('app.engine.time.time',lambda:market.now/1000)
+    diagnostic={'stage':'decision_schema','code':'invalid_levels','reason':'Niveaux BUY contradictoires'}
+    async def rejected(context):
+        return AIResult(wait('Réponse rejetée'), 'Niveaux BUY contradictoires',400,100,
+            error_kind='invalid_decision',diagnostic=diagnostic)
+    monkeypatch.setattr(ai,'decide',rejected)
+    await bot._analyze()
+    assert db.position() is None and db.get('cash')==900
+    row=db.rows('SELECT * FROM decisions')[-1]
+    import json
+    assert json.loads(row['detail'])['ai_diagnostic']==diagnostic
+    assert row['action']=='WAIT' and row['rejection']
+    assert bot.health['ai_error_kind']=='invalid_decision' and bot.health['ai_ok'] is False
+    async def valid(context):
+        return AIResult(buy_decision(),None,400,100)
+    monkeypatch.setattr(ai,'decide',valid)
+    market.now+=300000
+    await bot._analyze()
+    assert db.position() is not None
+    assert bot.health['ai_error'] is None and bot.health['ai_error_kind'] is None
+    assert bot.health['ai_ok'] is True

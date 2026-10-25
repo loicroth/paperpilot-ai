@@ -193,9 +193,10 @@
   function render(data) {
     state=data; const health=data.health || {}, control=data.control || {}, stats=data.stats || {};
     $('#configurationNotice').classList.toggle('hidden',Boolean(data.ai_configured)); set('#aiTag',data.ai_configured?'Clé présente':'Non configurée');
-    const status=health.status || 'PAUSE', unhealthy=/ERREUR|ERROR|INDISPONIBLE|NON CONFIGUR|INCONFIGUR/i.test(status) || health.market_ok === false || health.ai_ok === false;
+    const status=health.status || 'PAUSE', aiResponseRejected=health.ai_error_kind==='invalid_decision';
+    const unhealthy=/ERREUR|ERROR|INDISPONIBLE|NON CONFIGUR|INCONFIGUR/i.test(status) || health.market_ok === false || (health.ai_ok === false && !aiResponseRejected);
     set('#robotStatus',status); set('#robotMessage',health.message || (control.mode==='running'?'Le robot observe les marchés.':'Les nouvelles analyses sont arrêtées.'));
-    $('#robotDot').className=`dot ${unhealthy?'error':control.mode==='running'?'':'warn'}`;
+    $('#robotDot').className=`dot ${unhealthy?'error':aiResponseRejected || control.mode!=='running'?'warn':''}`;
     set('#connectionText','Serveur connecté'); $('#connectionDot').className='dot';
     set('#lastQuote',health.last_quote_at ? `Reçu à ${time(health.last_quote_at,true)}`:'Aucun cours reçu');
     set('#lastAnalysis',health.last_analysis_at ? time(health.last_analysis_at):'Aucune analyse');
