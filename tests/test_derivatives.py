@@ -169,3 +169,47 @@ def test_last_observed_valuation_survives_quote_outage(book):
     assert unavailable['equity']==pytest.approx(live['equity'],abs=1e-6)
     assert p['current_price']==99. and p['valuation_stale'] is True
     assert p['last_fx_ask']==1.01
+
+
+def cent_cfd_plan(reference=7.31,short=True,**changes):
+    d=proposal(short)
+    d.entry=7.30;d.stop_loss=7.42 if short else 7.18
+    d.take_profit=6.95 if short else 7.70
+    d.invalidation=7.40 if short else 7.20
+    for key,value in changes.items():setattr(d,key,value)
+    q=quote(reference,reference+.001) if short else quote(reference-.001,reference)
+    c=cfg();r=rules(tick_size=.001)
+    return RiskEngine.plan(d,q,r,c,900.,900.,atr=.04),d,q,c
+
+
+@pytest.mark.parametrize('short',[False,True])
+def test_cfd_one_cent_entry_zone_keeps_structural_levels_and_resizes_risk(short):
+    plan,d,q,c=cent_cfd_plan(short=short)
+    assert plan.entry==pytest.approx((q.bid if short else q.ask)*(1-.0005 if short else 1.0005))
+    assert plan.stop_loss==d.stop_loss and plan.take_profit==d.take_profit
+    assert plan.rr>=2 and plan.risk_usdt<=9.+1e-10
+    assert plan.margin+plan.entry_fee<=900.
+    original=cent_cfd_plan(reference=7.30,short=short)[0]
+    if short: assert plan.rr>original.rr and plan.quantity>original.quantity
+    else: assert plan.rr<original.rr and plan.quantity<original.quantity
+
+
+@pytest.mark.parametrize('short',[False,True])
+def test_cfd_entry_zone_outside_bound_refuses_both_directions(short):
+    with pytest.raises(RiskRejected,match='zone d’entrée'):
+        cent_cfd_plan(reference=7.34,short=short)
+
+
+@pytest.mark.parametrize('offset',[0.,.0001])
+def test_cfd_short_favorable_price_cannot_touch_or_cross_invalidation(offset):
+    d=proposal(True);d.entry=7.30;d.stop_loss=7.32;d.take_profit=7.10;d.invalidation=7.305
+    # A higher SHORT price is financially favorable but ask touching the
+    # structural invalidation invalidates the idea before the spread/slip fill.
+    q=quote(7.304,7.305+offset)
+    with pytest.raises(RiskRejected,match='Invalidation'):
+        RiskEngine.plan(d,q,rules(tick_size=.001),cfg(),900.,900.,atr=.04)
+
+
+def test_cfd_zone_does_not_force_rr_after_financing_costs():
+    with pytest.raises(RiskRejected,match='Ratio CFD net insuffisant'):
+        cent_cfd_plan(reference=7.31,short=False,take_profit=7.65)

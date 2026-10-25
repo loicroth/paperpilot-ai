@@ -51,7 +51,7 @@ class RiskEngine:
         if not decision.confirmation_met or decision.setup=='none': reject('Confirmation de configuration absente.')
         if atr is None or not math.isfinite(atr) or atr<=0: reject('ATR indisponible.')
         if atr/quote.ask*100>settings.max_atr_pct: reject('Volatilité excessive.')
-        if abs(decision.entry-quote.ask)>max(quote.ask*.001,atr*.25): reject('Cours déplacé depuis l’entrée proposée.')
+        validate_entry_zone(decision,quote,atr,settings)
         slip=settings.slippage_bps/10000
         entry=quote.ask*(1+slip)
         stop=floor_step(decision.stop_loss,rules.tick_size)
@@ -104,7 +104,7 @@ class RiskEngine:
         if not decision.confirmation_met or decision.setup=='none': reject('Confirmation de configuration absente.')
         if atr/quote.ask*100>settings.max_atr_pct: reject('Volatilité CFD excessive.')
         reference=quote.bid if short else quote.ask
-        if abs(decision.entry-reference)>max(reference*.001,atr*.25): reject('Cours CFD déplacé depuis la proposition.')
+        validate_entry_zone(decision,quote,atr,settings,short=short)
         tick=rules.tick_size
         if not math.isfinite(tick) or tick<=0: reject('Pas de prix CFD inconnu.')
         rounding=ROUND_UP if short else ROUND_DOWN
@@ -156,3 +156,25 @@ def cfd_fx(quote):
     if not all(isinstance(v,(int,float)) and math.isfinite(v) and v>0 for v in (bid,ask)) or bid>ask:
         raise RiskRejected('Conversion USD/USDT invalide.')
     return bid,ask
+
+
+
+def validate_entry_zone(decision,quote,atr,settings,short=False):
+    """Accept a bounded fresh entry, never repair a broken structural trade plan.
+
+    A cheaper LONG / higher SHORT may improve net reward/risk, but must not have
+    crossed structural invalidation. The exit side detects an invalidation even
+    when the spread or adverse fill would put the entry back above/below it.
+    """
+    if (quote.ask>=decision.invalidation if short else quote.bid<=decision.invalidation):
+        raise RiskRejected('Invalidation structurelle touchée ou franchie : entrée annulée.')
+    coefficient=getattr(settings,'entry_tolerance_atr',.75)
+    if not math.isfinite(coefficient) or not .25<=coefficient<=1.0:
+        raise RiskRejected('Paramètre de zone d’entrée invalide (0,25 à 1 ATR).')
+    reference=quote.bid if short else quote.ask
+    distance=abs(reference-decision.entry)
+    tolerance=max(decision.entry*.001,atr*coefficient)
+    if distance>tolerance+max(decision.entry,atr)*1e-12:
+        drift_pct=distance/decision.entry*100
+        tolerance_pct=tolerance/decision.entry*100
+        raise RiskRejected(f'Cours déplacé hors zone d’entrée : écart {drift_pct:.4f} % > tolérance {tolerance_pct:.4f} % ({coefficient:g} ATR ou 0,1 % minimum).')

@@ -298,3 +298,82 @@ def test_sell_rejects_nonfinite_ask(store,settings,rules):
     with pytest.raises(ValueError):
         PaperExecutionEngine(store).sell(quote(100,float('nan')),'Fixture invalid')
     assert store.position() is not None
+
+
+def entry_zone_decision(**updates):
+    payload=dict(symbol='BTCUSDT',action='BUY',reason='Fixture entrée structurelle.',entry=7.30,
+        stop_loss=7.18,take_profit=7.65,invalidation=7.20,confirmation='Structure clôturée confirmée.',
+        risks=['Gap'],setup='retest',confirmation_met=True)
+    payload.update(updates)
+    return Decision(**payload)
+
+
+def entry_zone_plan(ask,settings=None,decision_override=None,atr=.04):
+    settings=settings or Settings()
+    return RiskEngine.plan(decision_override or entry_zone_decision(),quote(bid=ask-.001,ask=ask),
+        Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),settings,900.,900.,atr=atr)
+
+
+def test_entry_zone_one_cent_adverse_move_resizes_actual_fill_without_moving_exits():
+    cfg=Settings()
+    initial=entry_zone_plan(7.30,cfg)
+    plan=entry_zone_plan(7.31,cfg)
+    assert plan.entry==pytest.approx(7.31*(1+cfg.slippage_bps/10000))
+    assert plan.stop_loss==7.18 and plan.take_profit==7.65
+    assert plan.rr>=2 and plan.risk_usdt<=9.+1e-10
+    assert plan.quantity<initial.quantity
+    loss=plan.entry*(1+cfg.fee_rate)-plan.stop_loss*(1-cfg.slippage_bps/10000)*(1-cfg.fee_rate)
+    assert plan.quantity==floor_step(9./loss,.001)
+    assert plan.entry_fee==pytest.approx(plan.entry*plan.quantity*cfg.fee_rate)
+
+
+def test_entry_zone_favorable_move_is_allowed_only_while_structure_remains_valid():
+    initial=entry_zone_plan(7.30)
+    cheaper=entry_zone_plan(7.29)
+    assert cheaper.rr>initial.rr and cheaper.quantity>initial.quantity
+    assert cheaper.risk_usdt<=9.+1e-10
+    assert cheaper.stop_loss==initial.stop_loss and cheaper.take_profit==initial.take_profit
+    invalidated=entry_zone_decision(stop_loss=7.28,take_profit=7.45,invalidation=7.295)
+    # Ask and adverse fill may be above the invalidation while the exit bid has
+    # already touched it; a superficially cheaper price does not repair structure.
+    with pytest.raises(RiskRejected,match='Invalidation'):
+        entry_zone_plan(7.2955,decision_override=invalidated)
+
+
+def test_entry_zone_still_requires_net_two_r_with_costs_even_inside_zone():
+    with pytest.raises(RiskRejected,match='Ratio net insuffisant'):
+        entry_zone_plan(7.32)
+
+
+def test_entry_zone_outside_atr_bound_is_refused_before_rr_or_sizing():
+    with pytest.raises(RiskRejected,match='zone d’entrée.*%.*%'):
+        entry_zone_plan(7.34)
+    # A large favorable move is still an obsolete entry rather than a new signal.
+    with pytest.raises(RiskRejected,match='zone d’entrée'):
+        entry_zone_plan(7.26)
+
+
+@pytest.mark.parametrize('bid_offset',[0.,-.0001])
+def test_entry_zone_invalidation_touch_and_cross_are_strict(bid_offset):
+    d=entry_zone_decision(stop_loss=7.28,take_profit=7.45,invalidation=7.295)
+    q=quote(bid=7.295+bid_offset,ask=7.296)
+    with pytest.raises(RiskRejected,match='Invalidation'):
+        RiskEngine.plan(d,q,Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),Settings(),900.,900.,atr=.04)
+
+
+def test_entry_zone_does_not_override_spread_guard():
+    with pytest.raises(RiskRejected,match='Spread'):
+        RiskEngine.plan(entry_zone_decision(),quote(bid=7.28,ask=7.31),
+            Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),Settings(),900.,900.,atr=.04)
+
+
+def test_entry_zone_settings_default_bounds_and_legacy_configuration():
+    from pydantic import ValidationError
+    assert Settings().entry_tolerance_atr==.75
+    legacy=Settings().model_dump();legacy.pop('entry_tolerance_atr')
+    assert Settings.model_validate(legacy).entry_tolerance_atr==.75
+    for value in [.25,1.]: assert Settings(entry_tolerance_atr=value).entry_tolerance_atr==value
+    for value in [.249,1.001,float('nan')]:
+        with pytest.raises(ValidationError): Settings(entry_tolerance_atr=value)
+    with pytest.raises(RiskRejected,match='zone d’entrée'):
+        entry_zone_plan(7.315,settings=Settings(entry_tolerance_atr=.25))

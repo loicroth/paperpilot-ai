@@ -220,7 +220,7 @@
   $('#settingsForm').addEventListener('input',()=>{dirtySettings=true;set('#settingsSaved','Modifications non enregistrées');});
   $('#settingsForm').addEventListener('submit',async(event)=>{
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
-    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
+    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
     body.auto_scanner=form.elements.auto_scanner.value==='true';
     body.cfd_enabled=form.elements.cfd_enabled.value==='true';
     body.allow_short=form.elements.allow_short.value==='true';

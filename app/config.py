@@ -25,6 +25,7 @@ class Settings(BaseModel):
     slippage_bps: float = Field(default=5, ge=0, le=100)
     max_spread_bps: float = Field(default=15, gt=0, le=100)
     max_atr_pct: float = Field(default=3, gt=0, le=10)
+    entry_tolerance_atr: float = Field(default=0.75, ge=0.25, le=1.0)
     model: str = Field(default=os.getenv('OPENAI_MODEL','gpt-4o-mini'), min_length=1, max_length=80, pattern=r'^[a-zA-Z0-9_.:-]+$')
     max_daily_calls: int = Field(default=288, ge=0, le=288)
     max_daily_tokens: int = Field(default=2000000, ge=0, le=5000000)

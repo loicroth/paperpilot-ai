@@ -477,6 +477,7 @@ class TradingEngine:
                         # Finish metadata I/O before the final executable quote.
                         self.rules.update(await self.market.rules([decision.symbol]))
                     q=await self.market.quote(decision.symbol); self.quotes[decision.symbol]=q
+                    detail['execution_quote']={'bid':q.bid,'ask':q.ask,'time_ms':q.time_ms}
                     if q.time_ms-expected>65000: raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
                     stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
                     if decision.action in {'BUY','SHORT'}:

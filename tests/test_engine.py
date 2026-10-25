@@ -390,7 +390,7 @@ async def test_metadata_delay_refetches_quote_and_revalidates_price_drift(rig,mo
     async def rules(symbols):
         if ai.contexts:
             market.now+=16000
-            market.price=100.5
+            market.price=101.0
         return await original(symbols)
     monkeypatch.setattr(market,'rules',rules)
     await engine._analyze()
