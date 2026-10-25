@@ -21,6 +21,14 @@
   const pnlClass = (el, value) => { el.classList.remove('positive','negative'); if (n(value) !== null && n(value) !== 0) el.classList.add(n(value) > 0 ? 'positive' : 'negative'); };
   const array = (value) => Array.isArray(value) ? value : [];
   const actionTag = (action) => element('span', `action ${String(action || 'WAIT').toLowerCase()}`, action || 'WAIT');
+  const proposalLabels = {BUY:'Proposition d’achat',SHORT:'Proposition de vente à découvert',SELL:'Proposition de clôture'};
+  const refusalLabels = {BUY:'ACHAT REFUSÉ',SHORT:'VENTE À DÉCOUVERT REFUSÉE',SELL:'CLÔTURE REFUSÉE'};
+  function decisionTag(decision) {
+    const action = String(decision.action || 'WAIT'), proposal = proposalLabels[action];
+    if (!proposal) return actionTag(action);
+    return element('span', `action ${decision.rejection ? 'sell' : 'wait'}`, decision.rejection ? refusalLabels[action] : proposal);
+  }
+
   function notify(message, isError = false) { const toast = $('#toast'); toast.textContent = message; toast.className = `toast${isError ? ' error' : ''}`; clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.add('hidden'), 6000); }
   function error(message) { const box = $('#requestError'); box.textContent = message; box.classList.toggle('hidden', !message); }
   function showView(view) {
@@ -136,9 +144,9 @@
   function renderDecision(decisions) {
     const decision = decisions[0], target = $('#lastDecision'); target.replaceChildren();
     if (!decision) { target.className='decision-empty'; target.append(actionTag('WAIT'),element('p','','Aucune analyse enregistrée. Démarrez la simulation après avoir configuré l’IA.')); return; }
-    target.className=''; const heading = element('div','decision-head'); heading.append(actionTag(decision.action),element('strong','',decision.symbol || 'Marchés comparés')); target.append(heading,element('p','decision-reason',decision.reason || '—'));
-    if (decision.rejection) target.append(element('p','rejection',decision.rejection));
-    target.append(detailButton(`Décision ${decision.action} · ${decision.symbol}`,time(decision.at),decision.detail || decision));
+    target.className=''; const heading = element('div','decision-head'); heading.append(decisionTag(decision),element('strong','',decision.symbol || 'Marchés comparés')); target.append(heading,element('p','decision-reason',decision.reason || '—'));
+    if (decision.rejection) target.append(element('p','rejection',`Motif du refus : ${decision.rejection}`));
+    target.append(detailButton(`${proposalLabels[decision.action] || 'Décision '+decision.action} · ${decision.symbol}`,time(decision.at),decision.detail || decision));
   }
   function renderTables(trades,decisions) {
     const tradeBody = $('#tradesBody'); tradeBody.replaceChildren();
@@ -149,7 +157,7 @@
     });
     const decisionBody = $('#decisionsBody'); decisionBody.replaceChildren();
     if (!decisions.length) { const row = element('tr'),cell = element('td','empty','Aucune décision enregistrée.'); cell.colSpan=6; row.append(cell); decisionBody.append(row); }
-    decisions.forEach(decision => { const row = element('tr'); row.append(element('td','',time(decision.at)),element('td','',decision.symbol || '—')); const actionCell = element('td'); actionCell.append(actionTag(decision.action)); row.append(actionCell,element('td','table-reason',decision.reason || '—'),element('td','table-reason',decision.rejection || '—')); const detailCell = element('td'); detailCell.append(detailButton('Détail de la décision',`${time(decision.at)} · ${decision.symbol || ''}`,decision.detail || decision)); row.append(detailCell); decisionBody.append(row); });
+    decisions.forEach(decision => { const row = element('tr'); row.append(element('td','',time(decision.at)),element('td','',decision.symbol || '—')); const actionCell = element('td'); actionCell.append(decisionTag(decision)); row.append(actionCell,element('td','table-reason',decision.reason || '—'),element('td','table-reason',decision.rejection || (proposalLabels[decision.action] ? 'Aucun refus enregistré' : '—'))); const detailCell = element('td'); detailCell.append(detailButton('Détail de la décision',`${time(decision.at)} · ${decision.symbol || ''}`,decision.detail || decision)); row.append(detailCell); decisionBody.append(row); });
   }
   function renderEvents(events) {
     const container = $('#events'); container.replaceChildren();

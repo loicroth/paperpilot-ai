@@ -96,14 +96,19 @@ class TradingEngine:
     def history_diagnostic(self):
         """Private operational report, no credentials, balances or raw AI context."""
         from collections import Counter
-        since=datetime.fromtimestamp(time.time()-12*3600,timezone.utc).isoformat(timespec='milliseconds')
+        since=datetime.fromtimestamp(time.time()-48*3600,timezone.utc).isoformat(timespec='milliseconds')
         rows=self.store.rows('SELECT at,symbol,action,reason,rejection,detail FROM decisions WHERE at>=? ORDER BY id DESC',(since,))
         actions=Counter(row['action'] for row in rows)
         rejections=Counter(row['rejection'] for row in rows if row['rejection'])
-        selected=[]
+        selected=[]; orders=[]
         for row in rows:
             try: detail=json.loads(row['detail']) if isinstance(row['detail'],str) else row['detail']
-            except Exception: continue
+            except Exception: detail={}
+            if row['action'] in {'BUY','SHORT','SELL'} and len(orders)<40:
+                proposal=detail.get('proposal') if isinstance(detail,dict) else None
+                orders.append({'at':row['at'],'symbol':row['symbol'],'action':row['action'],
+                    'reason':row['reason'],'rejection':row['rejection'],
+                    'proposal':{k:proposal[k] for k in ('entry','stop_loss','take_profit','invalidation','setup','confirmation_met') if k in proposal} if isinstance(proposal,dict) else None})
             context=detail.get('context',{}) if isinstance(detail,dict) else {}
             proposals=context.get('candidates',{}) if isinstance(context,dict) else {}
             if not isinstance(proposals,dict): continue
@@ -113,7 +118,10 @@ class TradingEngine:
                     'reason':row['reason'],'rejection':row['rejection'],'admitted':admitted,
                     'proposal':detail.get('proposal'),'usage':detail.get('usage')})
         report={'since_utc':since,'decisions':len(rows),'actions':dict(actions),
-            'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected}
+            'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected,
+            'order_decisions':orders,
+            'trade_count':self.store.rows('SELECT COUNT(*) AS n FROM trades WHERE opened_at>=?',(since,))[0]['n'],
+            'open_trade_count':self.store.rows('SELECT COUNT(*) AS n FROM trades WHERE closed_at IS NULL')[0]['n']}
         log.info('PAPER_HISTORY_REPORT %s',json.dumps(report,ensure_ascii=False))
         return report
     def diagnostic(self):
@@ -483,4 +491,7 @@ class TradingEngine:
                     if not self.store.position(): raise RiskRejected('HOLD sans position : aucun ordre.')
             except (ValueError,MarketError) as exc: rejection=str(exc)
             self.store.decision(decision,rejection,detail)
+            if decision.action in {'BUY','SHORT','SELL'}:
+                log.info('PAPER_ORDER_REVIEW %s',json.dumps({'at':self.store.get('last_analysis_at'),
+                    'symbol':decision.symbol,'action':decision.action,'rejection':rejection,'signal_id':key},ensure_ascii=False))
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
