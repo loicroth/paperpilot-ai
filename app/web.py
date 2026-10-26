@@ -76,7 +76,7 @@ def create_app(env=None,store=None,engine=None,background=True):
             if health['last_quote_at']:
                 age=(datetime.now(timezone.utc)-datetime.fromisoformat(health['last_quote_at'])).total_seconds()
                 if age>20: health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message='Dernière cotation trop ancienne. Aucune nouvelle entrée autorisée.')
-            return {'providers':bot.market.status() if hasattr(bot.market,'status') else {},'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'position':p,
+            return {'providers':bot.market.status() if hasattr(bot.market,'status') else {},'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'positions':stats.get('positions',[p] if p else []),'position':p,
                 'quotes':[{**asdict(q),'spread_bps':(q.ask-q.bid)/q.bid*10000} for q in bot.quotes.values()],
                 'decisions':decisions,'trades':db.trades()[:250], 'equity':series,
                 'events':db.rows('SELECT at,level,message FROM events ORDER BY id DESC LIMIT 60'),
@@ -98,17 +98,21 @@ def create_app(env=None,store=None,engine=None,background=True):
             db.set('mode',modes[action])
             db.event({'start':'Simulation démarrée. Seules les futures clôtures M5 sont analysées.',
                 'pause':'Nouvelles entrées en pause ; protection et sorties IA conservées.',
-                'stop':'Analyses arrêtées ; protection de la position conservée tant que le serveur fonctionne.'}[action])
+                'stop':'Analyses arrêtées ; protection des positions conservée tant que le serveur fonctionne.'}[action])
         return {'ok':True,'mode':modes[action]}
     @app.put('/api/settings')
     async def settings(request:Request):
         try: cfg=Settings.model_validate(await request.json())
         except Exception as exc: raise HTTPException(422,str(exc)[:1000])
-        p=db.position()
-        if p and not p['symbol'].startswith('CAP:') and not cfg.auto_scanner and p['symbol'] not in cfg.symbols: raise HTTPException(409,'Conservez le marché de la position ouverte jusqu’à sa clôture.')
+        def keep_held_markets():
+            if not cfg.auto_scanner and any(not p['symbol'].startswith('CAP:') and p['symbol'] not in cfg.symbols for p in db.positions()):
+                raise HTTPException(409,'Conservez les marchés de toutes les positions Spot ouvertes jusqu’à leur clôture.')
+        keep_held_markets()
         try: await bot.market.rules(cfg.symbols)
         except Exception as exc: raise HTTPException(400,f'Validation Binance impossible : {str(exc)[:300]}')
         async with bot.lock:
+            # A position can open while market rules are downloaded.
+            keep_held_markets()
             db.set('settings',cfg.model_dump()); bot._settings_revision+=1
             # Re-evaluate a tighter daily threshold immediately.
             stats,_=statistics(db,bot.quotes); bot.day_state(stats['equity'])
@@ -122,8 +126,8 @@ def create_app(env=None,store=None,engine=None,background=True):
             raise HTTPException(422,'Les trois champs de connexion démo sont requis.')
         async with bot.lock:
             if bot.provider_setup: raise HTTPException(409,'Connexion déjà en cours.')
-            if db.position() and db.position()['symbol'].startswith('CAP:'):
-                raise HTTPException(409,'Clôturez la position CFD avant de remplacer sa connexion de données.')
+            if any(p['symbol'].startswith('CAP:') for p in db.positions()):
+                raise HTTPException(409,'Clôturez toutes les positions CFD avant de remplacer leur connexion de données.')
             bot.provider_setup=True; bot._settings_revision+=1
         try:
             await bot.market.setup_capital(body)
@@ -141,6 +145,7 @@ def create_app(env=None,store=None,engine=None,background=True):
         body=await request.json()
         if body.get('confirmation')!='REINITIALISER': raise HTTPException(400,'Confirmation REINITIALISER requise.')
         async with bot.lock:
+            await bot.reset_reconciliation_tasks()
             backup_dir=env.data_dir/'backups'; backup_dir.mkdir(parents=True,exist_ok=True)
             name='avant_reset_'+datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')+'.sqlite3'
             with sqlite3.connect(backup_dir/name) as target: db.conn.backup(target)

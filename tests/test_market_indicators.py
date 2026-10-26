@@ -179,8 +179,21 @@ async def test_live_binance_market_data():
 def test_long_refusal_explains_bearish_h1_without_authorizing_trade():
     from app.indicators import long_refusals,candidates
     m={'last':{'open':100.,'close':100.2,'high':100.4,'low':99.9},'previous':{'close':100.},'atr14':1.,'atr_pct':1.,'ema21':100.,'rsi14':55.,'volume_ratio':1.5}
-    h={'last':{'close':99.},'ema21':100.,'ema21_previous':100.2}
+    h={'last':{'close':99.},'ema21':100.,'ema21_previous':100.2,'ema50':101.}
     reasons=long_refusals(m,h)
     assert any('H1 sous EMA21' in x for x in reasons)
     assert any('descendante' in x for x in reasons)
     assert candidates(m,h)==[]
+
+
+def test_reversal_requires_h1_alignment_instead_of_neutral_bounce():
+    base=snapshot(candles())
+    rows=[dict(base['last'],low=98. if i<6 else 99.,high=100.2) for i in range(12)]
+    rows[-1]=dict(rows[-1],open=100.,close=101.,high=101.2,low=99.9)
+    m=dict(base,atr14=1.,atr_pct=1.,ema21=100.,ema9=100.5,rsi14=60.,
+        macd_hist=.2,macd_hist_previous=.1,volume_ratio=1.5,resistance=102.,
+        last=rows[-1],previous=rows[-2],candles=rows)
+    neutral=dict(base,ema21=100.,ema21_previous=99.9,ema50=101.,last=dict(base['last'],close=100.5))
+    aligned=dict(neutral,ema50=99.)
+    assert 'reversal' not in candidates(m,neutral)
+    assert 'reversal' in candidates(m,aligned)

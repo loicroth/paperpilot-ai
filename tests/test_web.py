@@ -55,7 +55,14 @@ def open_fixture(web):
         stop_loss=99.0,take_profit=103.5,invalidation=99.2,confirmation='Clôture fixture.',
         risks=['Données synthétiques de test'],setup='breakout',confirmation_met=True)
     cfg=Settings(); rules=Rules('BTCUSDT',.001,100000.0,.001,5.0,1000000.0,.01)
-    plan=RiskEngine.plan(d,q,rules,cfg,900,900,atr=.8)
+    # Coherent observed fixture ranges justify both the structural stop and target.
+    context={}
+    for name,duration in [('m5',300000),('h1',3600000)]:
+        end=q.time_ms//duration*duration-1
+        bars=[{'open_time':end-(5-i)*duration-duration+1,'close_time':end-(5-i)*duration,
+               'open':100.,'high':104.,'low':99.2,'close':100.,'volume':100.} for i in range(6)]
+        context[name]={'candles':bars,'atr14':.8,'last':bars[-1]}
+    plan=RiskEngine.plan(d,q,rules,cfg,900,900,atr=.8,structure_context=context)
     return web.bot.paper.buy(plan,q,'fixture-http-m5',d,cfg,{'fixture':True})
 
 @pytest.mark.asyncio
@@ -215,3 +222,87 @@ async def test_realistic_quote_latency_does_not_mark_fresh_reception_as_future(w
     await web.bot.tick()
     assert web.bot.health['market_ok'] is True
     assert len(web.bot.quotes)==3
+
+
+def add_open_fixture(web, symbol='ETHUSDT', kind='spot'):
+    """A second tiny holding for HTTP guards; not a strategy/backtest result."""
+    first=dict(web.store.rows('SELECT * FROM trades WHERE closed_at IS NULL ORDER BY id LIMIT 1')[0])
+    first.pop('id')
+    first.update(symbol=symbol,signal='fixture-http-'+symbol,quantity=.1,risk_usdt=.1,
+                 entry_fee=.01,fees=.01,kind=kind)
+    if kind=='cfd':
+        first.update(currency='USD',margin=5.,leverage=2.,direction='LONG',fx_open=1.)
+    columns=list(first)
+    web.store.conn.execute('INSERT INTO trades('+','.join(columns)+') VALUES('+','.join('?' for _ in columns)+')',tuple(first.values()))
+    cost=(5. if kind=='cfd' else first['quantity']*first['entry'])+first['entry_fee']
+    web.store.set('cash',web.store.get('cash')-cost)
+    web.bot.quotes[symbol]=Quote(symbol,100.,100.01,int(time.time()*1000),currency='USD' if kind=='cfd' else 'USDT')
+    return web.store.position(symbol)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_all_open_positions_and_compatibility_first(web):
+    first=open_fixture(web);second=add_open_fixture(web)
+    web.bot.quotes['BTCUSDT']=Quote('BTCUSDT',100.,100.01,int(time.time()*1000))
+    async with client(web) as c:
+        response=await c.get('/api/state');assert response.status_code==200
+        data=response.json()
+        assert [p['id'] for p in data['positions']]==[first['id'],second['id']]
+        assert data['position']['id']==first['id']
+        assert len(data['stats']['positions'])==data['stats']['open_positions_count']==2
+        assert all('unrealized_pnl' in p and 'current_price' in p for p in data['positions'])
+        assert data['stats']['portfolio_risk_known'] is True
+        assert data['stats']['portfolio_risk_used'] is not None
+
+
+@pytest.mark.asyncio
+async def test_settings_cannot_remove_second_open_spot_market(web):
+    open_fixture(web);second=add_open_fixture(web)
+    async with client(web) as c:
+        headers=await token(c);settings=(await c.get('/api/state')).json()['settings']
+        settings.update(symbols=['BTCUSDT'],auto_scanner=False)
+        r=await c.put('/api/settings',json=settings,headers=headers)
+        assert r.status_code==409
+        assert web.store.position('ETHUSDT')['id']==second['id']
+
+
+@pytest.mark.asyncio
+async def test_settings_rechecks_all_holdings_after_rules_download(web,monkeypatch):
+    open_fixture(web)
+    original=web.market.rules
+    async def rules(symbols):
+        add_open_fixture(web)
+        return await original(symbols)
+    monkeypatch.setattr(web.market,'rules',rules)
+    async with client(web) as c:
+        headers=await token(c);settings=(await c.get('/api/state')).json()['settings']
+        settings.update(symbols=['BTCUSDT'],auto_scanner=False)
+        assert (await c.put('/api/settings',json=settings,headers=headers)).status_code==409
+        assert len(web.store.positions())==2
+
+
+@pytest.mark.asyncio
+async def test_capital_replacement_blocked_when_cfd_is_not_first_position(web,monkeypatch):
+    open_fixture(web);add_open_fixture(web,'CAP:FIXTURE','cfd')
+    calls=[]
+    async def setup(body):calls.append(body)
+    monkeypatch.setattr(web.market,'setup_capital',setup,raising=False)
+    async with client(web) as c:
+        headers=await token(c)
+        r=await c.post('/api/providers/capital/setup',json={'api_key':'fixture','identifier':'fixture','api_password':'fixture'},headers=headers)
+        assert r.status_code==409 and calls==[]
+        assert web.store.position()['symbol']=='BTCUSDT'
+        assert len(web.store.positions())==2
+
+
+@pytest.mark.asyncio
+async def test_reset_archives_every_open_holding_before_clearing(web):
+    first=open_fixture(web);second=add_open_fixture(web)
+    async with client(web) as c:
+        headers=await token(c)
+        assert (await c.post('/api/reset',json={'confirmation':'incorrect'},headers=headers)).status_code==400
+        assert len(web.store.positions())==2
+        r=await c.post('/api/reset',json={'confirmation':'REINITIALISER'},headers=headers)
+        assert r.status_code==200 and web.store.positions()==[]
+        with sqlite3.connect(web.env.data_dir/'backups'/r.json()['backup']) as archive:
+            assert [row[0] for row in archive.execute('SELECT id FROM trades WHERE closed_at IS NULL ORDER BY id')]==[first['id'],second['id']]

@@ -1,7 +1,8 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import math, time
+from .structure import validate_structural_plan, StructureRejected
 
 class RiskRejected(ValueError): pass
 @dataclass
@@ -23,6 +24,8 @@ class OrderPlan:
     fx_open: float = 1.
     financing_daily: float = 0.
     maintenance_margin_pct: float = 50.
+    structure_audit: dict = field(default_factory=dict)
+    risk_pct_used: float = 0.
 
 def D(v): return Decimal(str(v))
 def floor_step(value,step):
@@ -31,12 +34,12 @@ def floor_step(value,step):
 
 class RiskEngine:
     @staticmethod
-    def plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None):
+    def plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None,structure_context=None,portfolio_positions=None,portfolio_quotes=None,risk_budget_pct=None):
         if str(decision.symbol).startswith('CAP:'):
-            return RiskEngine.cfd_plan(decision,quote,rules,settings,cash,equity,position,paused,day_blocked,atr,now_ms)
+            return RiskEngine.cfd_plan(decision,quote,rules,settings,cash,equity,position,paused,day_blocked,atr,now_ms,structure_context,portfolio_positions,portfolio_quotes,risk_budget_pct)
         def reject(reason): raise RiskRejected(reason)
         if decision.action!='BUY': reject('Proposition sans achat.')
-        if position: reject('Une position est déjà ouverte : aucun renforcement autorisé.')
+        positions=admit_portfolio(decision,settings,position,portfolio_positions)
         if paused: reject('Nouvelles entrées en pause.')
         if day_blocked: reject('Limite de perte journalière atteinte : pause jusqu’à demain UTC.')
         if decision.symbol not in settings.symbols or quote.symbol!=decision.symbol or rules.symbol!=decision.symbol:
@@ -58,32 +61,37 @@ class RiskEngine:
         target=floor_step(decision.take_profit,rules.tick_size)
         if not 0<stop<entry<target: reject('Stop/objectif invalides après arrondi Binance.')
         if entry-stop<atr*.35: reject('Stop trop proche du bruit de marché (0,35 ATR minimum).')
-        if entry-stop>atr*4: reject('Stop trop éloigné (4 ATR maximum).')
+        try: structure=validate_structural_plan(structure_context,entry,stop,target,now_ms=now_ms)
+        except StructureRejected as exc: reject(str(exc))
+        risk_pct=trade_risk_pct(decision,settings,equity,positions,portfolio_quotes,now_ms,risk_budget_pct)
         loss=entry*(1+settings.fee_rate)-stop*(1-slip)*(1-settings.fee_rate)
         reward=target*(1-slip)*(1-settings.fee_rate)-entry*(1+settings.fee_rate)
         rr=reward/loss
         if reward<=0 or rr+1e-10<settings.min_rr: reject(f'Ratio net insuffisant : {rr:.2f}R.')
-        max_by_risk=equity*settings.risk_pct/100/loss
-        max_by_cash=cash/(entry*(1+settings.fee_rate))
+        max_by_risk=equity*risk_pct/100/loss
+        # Reserve liquidity for the other configured slots; a narrow Spot stop
+        # must not consume the whole wallet before the second signal arrives.
+        allocation=min(cash,equity/settings.max_positions)
+        max_by_cash=allocation/(entry*(1+settings.fee_rate))
         qty=floor_step(min(max_by_risk,max_by_cash,rules.max_qty),rules.step_size)
         if qty<=0 or qty+1e-12<rules.min_qty: reject('Quantité sous le minimum Binance ou capital insuffisant.')
         notional=qty*entry
         if notional<rules.min_notional or (rules.max_notional and notional>rules.max_notional): reject('Montant hors limites Binance.')
         fee=notional*settings.fee_rate
         if notional+fee>cash+1e-8: reject('Capital insuffisant, commissions incluses.')
-        if qty*loss>equity*settings.risk_pct/100+1e-8: reject('Risque maximal dépassé.')
-        return OrderPlan(decision.symbol,qty,entry,stop,target,fee,qty*loss,rr)
+        if qty*loss>equity*risk_pct/100+1e-8: reject('Risque maximal dépassé.')
+        return OrderPlan(decision.symbol,qty,entry,stop,target,fee,qty*loss,rr,structure_audit=structure,risk_pct_used=qty*loss/equity*100)
 
 
     @staticmethod
-    def cfd_plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None):
+    def cfd_plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None,structure_context=None,portfolio_positions=None,portfolio_quotes=None,risk_budget_pct=None):
         def reject(reason): raise RiskRejected(reason)
         if not getattr(settings,'cfd_enabled',False): reject('Simulation CFD désactivée.')
         if decision.action not in {'BUY','SHORT'}: reject('Proposition sans ouverture CFD.')
         short=decision.action=='SHORT'; direction=-1 if short else 1
         if short and (not getattr(settings,'allow_short',False) or not getattr(rules,'allow_short',False)):
             reject('Vente à découvert CFD non autorisée pour ce marché.')
-        if position: reject('Une position est déjà ouverte : aucun renforcement autorisé.')
+        positions=admit_portfolio(decision,settings,position,portfolio_positions)
         if paused or day_blocked: reject('Nouvelles entrées en pause ou limite journalière atteinte.')
         if decision.symbol not in settings.symbols or quote.symbol!=decision.symbol or rules.symbol!=decision.symbol:
             reject('Marché non autorisé ou données contradictoires.')
@@ -95,7 +103,7 @@ class RiskEngine:
         fx_bid,fx_ask=cfd_fx(quote)
         prices=[cash,equity,quote.bid,quote.ask,decision.entry,decision.stop_loss,decision.take_profit,decision.invalidation,atr]
         if any(x is None or not math.isfinite(x) or x<=0 for x in prices): reject('Montant, prix ou ATR CFD invalide.')
-        if not math.isfinite(settings.risk_pct) or not 0<settings.risk_pct<=1: reject('Risque maximal CFD limité à 1 %.')
+        if not math.isfinite(settings.risk_pct) or not 0<settings.risk_pct<=1.4: reject('Risque maximal CFD limité à 1,4 %.')
         if quote.bid>quote.ask: reject('Cotation CFD incohérente.')
         if (quote.ask-quote.bid)/quote.bid*10000>settings.max_spread_bps: reject('Spread CFD trop élevé.')
         if short:
@@ -114,7 +122,10 @@ class RiskEngine:
         if not 0<=slip<=.01 or not 0<=settings.fee_rate<=.01: reject('Frais/glissement CFD invalides.')
         entry=reference*(1-slip if short else 1+slip)
         distance=direction*(entry-stop)
-        if not .35*atr<=distance<=4*atr or direction*(target-entry)<=0: reject('Stop CFD incompatible avec le bruit ATR ou objectif invalide.')
+        if distance<.35*atr or direction*(target-entry)<=0: reject('Stop CFD incompatible avec le bruit ATR ou objectif invalide.')
+        try: structure=validate_structural_plan(structure_context,entry,stop,target,short=short,now_ms=now_ms)
+        except StructureRejected as exc: reject(str(exc))
+        risk_pct=trade_risk_pct(decision,settings,equity,positions,portfolio_quotes,now_ms,risk_budget_pct)
         margin_pct=getattr(rules,'min_margin_pct',0)
         requested=getattr(settings,'cfd_leverage',1)
         if not math.isfinite(margin_pct) or not 0<margin_pct<=100: reject('Marge fournisseur inconnue ou incompatible.')
@@ -135,16 +146,18 @@ class RiskEngine:
         filters=[rules.max_qty,rules.min_qty,rules.step_size,rules.min_notional,rules.max_notional]
         if not all(math.isfinite(x) and x>=0 for x in filters) or rules.max_qty<=0 or rules.step_size<=0:
             reject('Contraintes de quantité CFD invalides.')
-        max_qty=min(equity*settings.risk_pct/100/loss,cash/(margin_unit+fee_per_entry),rules.max_qty)
+        allocation=min(cash,equity/settings.max_positions)
+        max_qty=min(equity*risk_pct/100/loss,allocation/(margin_unit+fee_per_entry),rules.max_qty)
         qty=floor_step(max_qty,rules.step_size)
         if qty<=0 or qty+1e-12<rules.min_qty: reject('Quantité CFD minimale incompatible avec le capital/risque.')
         notional=qty*entry
         if notional<rules.min_notional or (rules.max_notional and notional>rules.max_notional): reject('Montant CFD hors limites fournisseur.')
         margin=qty*margin_unit; fee=qty*fee_per_entry
-        if margin+fee>cash+1e-8 or qty*loss>equity*settings.risk_pct/100+1e-8: reject('Capital ou risque CFD dépassé.')
+        if margin+fee>cash+1e-8 or qty*loss>equity*risk_pct/100+1e-8: reject('Capital ou risque CFD dépassé.')
         return OrderPlan(decision.symbol,qty,entry,stop,target,fee,qty*loss,reward/loss,
             kind='cfd',direction='SHORT' if short else 'LONG',margin=margin,leverage=leverage,
-            multiplier=1.,currency='USD',fx_open=fx_ask,financing_daily=financing,maintenance_margin_pct=maintenance)
+            multiplier=1.,currency='USD',fx_open=fx_ask,financing_daily=financing,maintenance_margin_pct=maintenance,
+            structure_audit=structure,risk_pct_used=qty*loss/equity*100)
 
 
 def cfd_fx(quote):
@@ -178,3 +191,70 @@ def validate_entry_zone(decision,quote,atr,settings,short=False):
         drift_pct=distance/decision.entry*100
         tolerance_pct=tolerance/decision.entry*100
         raise RiskRejected(f'Cours déplacé hors zone d’entrée : écart {drift_pct:.4f} % > tolérance {tolerance_pct:.4f} % ({coefficient:g} ATR ou 0,1 % minimum).')
+
+
+def admit_portfolio(decision,settings,position=None,portfolio_positions=None):
+    if portfolio_positions is None:
+        positions=list(position) if isinstance(position,(list,tuple)) else [position] if position else []
+    else: positions=list(portfolio_positions)
+    maximum=getattr(settings,'max_positions',3)
+    if not isinstance(maximum,int) or not 1<=maximum<=6:raise RiskRejected('Nombre maximal de positions invalide.')
+    if len(positions)>=maximum:raise RiskRejected('Nombre maximal de positions ouvertes atteint.')
+    if any(p.get('symbol')==decision.symbol for p in positions):
+        raise RiskRejected('Position déjà ouverte sur ce marché : renforcement, moyennage et couverture interdits.')
+    return positions
+
+
+def trade_risk_pct(decision,settings,equity,positions,quotes=None,now_ms=None,budget=None):
+    if not math.isfinite(settings.min_rr) or settings.min_rr<2:raise RiskRejected('Ratio net minimal de sécurité : 2R.')
+    desired=getattr(decision,'risk_pct',None)
+    desired=settings.risk_pct if desired is None else desired
+    per_trade=getattr(settings,'max_trade_risk_pct',1.4)
+    portfolio=getattr(settings,'max_portfolio_risk_pct',2.)
+    if not all(isinstance(x,(int,float)) and math.isfinite(x) and x>0 for x in (desired,per_trade,portfolio,equity)):
+        raise RiskRejected('Budget de risque invalide.')
+    if desired>1.4 or per_trade>1.4 or portfolio>4:
+        raise RiskRejected('Plafond de risque de sécurité dépassé.')
+    if desired>per_trade+1e-12:raise RiskRejected('Risque proposé supérieur au plafond par trade.')
+    remaining=equity*portfolio/100-portfolio_remaining_risk(positions,quotes,now_ms)
+    if remaining<=0 or not math.isfinite(remaining):raise RiskRejected('Budget de risque total du portefeuille épuisé ou non vérifiable.')
+    allowed=min(desired,per_trade,remaining/equity*100)
+    if budget is not None:
+        if not isinstance(budget,(int,float)) or not math.isfinite(budget) or budget<=0:
+            raise RiskRejected('Budget de risque restant nul ou invalide.')
+        allowed=min(allowed,budget)
+    return allowed
+
+
+def remaining_position_risk(position,quote=None,now_ms=None):
+    """Conservative additional mark-to-stop exposure, never net winning positions.
+
+    Current mark is gross exit-side value; stop includes adverse slippage, exit
+    fees and another day of estimated CFD financing. Entry fees are already paid.
+    No quote or an already breached stop gives infinity to block fresh entries.
+    """
+    now_ms=int(time.time()*1000) if now_ms is None else now_ms
+    try:
+        if quote is None or quote.symbol!=position['symbol'] or not 0<=now_ms-quote.time_ms<=15000:return math.inf
+        quantity=float(position['quantity']);stop=float(position['stop_loss'])
+        slip=float(position.get('slippage_bps',0))/10000;fee=float(position.get('fee_rate',0))
+        values=[quantity,stop,quote.bid,quote.ask]
+        if any(not math.isfinite(v) or v<=0 for v in values) or quote.bid>quote.ask or not 0<=slip<=.01 or not 0<=fee<=.01:return math.inf
+        if position.get('kind','spot')=='cfd':
+            if getattr(quote,'currency',None)!='USD' or float(position.get('multiplier',1))!=1:return math.inf
+            short=position.get('direction')=='SHORT';sign=-1 if short else 1
+            reference=quote.ask if short else quote.bid
+            if sign*(reference-stop)<=0:return math.inf
+            fx_bid,fx_ask=cfd_fx(quote)
+            fill=stop*(1+slip if short else 1-slip)
+            financing=float(position.get('financing_daily',0));entry=float(position['entry'])
+            if not math.isfinite(financing) or not 0<=financing<=.05:return math.inf
+            return max(0.,quantity*(sign*(reference-fill)+fill*fee+entry*financing)*fx_ask)
+        if quote.bid<=stop:return math.inf
+        return max(0.,quantity*(quote.bid-stop*(1-slip)*(1-fee)))
+    except (KeyError,ValueError,TypeError,AttributeError,RiskRejected):return math.inf
+
+
+def portfolio_remaining_risk(positions,quotes=None,now_ms=None):
+    quotes=quotes or {}
+    return sum(remaining_position_risk(p,quotes.get(p['symbol']),now_ms) for p in positions)

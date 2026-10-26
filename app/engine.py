@@ -6,8 +6,9 @@ from .config import Settings
 from .market import BinanceClient, MarketError
 from .multimarket import MultiMarket
 from .indicators import snapshot, candidates, short_candidates, long_refusals
-from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS
-from .risk import RiskEngine, RiskRejected
+from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
+from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
+from .structure import structural_levels
 from .execution import PaperExecutionEngine
 from .metrics import statistics
 from .storage import utcnow, dumps
@@ -27,6 +28,8 @@ class TradingEngine:
         self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None; self.verify_task=None
         self.started_ms=int(time.time()*1000); self.last_error=None; self.last_snapshot=0.; self.last_analysis_poll=0.; self.closing=False
         self.reconciled=False; self.provider_setup=False; self._settings_revision=0; self.critical_error=None
+        self._position_reconciled={}
+        self._reconciliation_tasks={}; self._reconciliation_locks={}
         # Persist the user's run intent. New entries still require fresh, post-start
         # candles, current data, reconciliation, API/risk checks and daily loss gate.
         mode=self.store.get('mode','stopped')
@@ -71,9 +74,10 @@ class TradingEngine:
         self.diagnostic()
     async def close(self):
         self.closing=True
-        for t in (self.verify_task,self.analysis_task,self.task):
-            if t: t.cancel()
-        await asyncio.gather(*[t for t in (self.verify_task,self.analysis_task,self.task) if t],return_exceptions=True)
+        tasks=[t for t in (self.verify_task,self.analysis_task,self.task) if t]+list(self._reconciliation_tasks.values())
+        for task in tasks: task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
+        self._reconciliation_tasks.clear();self._reconciliation_locks.clear()
         await self.market.close()
         if hasattr(self.ai,'close'): await self.ai.close()
     def error(self,message):
@@ -125,7 +129,8 @@ class TradingEngine:
             'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected,
             'order_decisions':orders,
             'trade_count':self.store.rows('SELECT COUNT(*) AS n FROM trades WHERE opened_at>=?',(since,))[0]['n'],
-            'open_trade_count':self.store.rows('SELECT COUNT(*) AS n FROM trades WHERE closed_at IS NULL')[0]['n']}
+            'open_trade_count':len(self.store.positions()),
+            'trades':self.store.rows('SELECT id,symbol,kind,direction,opened_at,closed_at,entry,exit,stop_loss,take_profit,quantity,risk_usdt,fees,financing_accrued,net_pnl,exit_reason FROM trades WHERE opened_at>=? ORDER BY id DESC LIMIT 20',(since,))}
         log.info('PAPER_HISTORY_REPORT %s',json.dumps(report,ensure_ascii=False))
         return report
     def diagnostic(self):
@@ -137,7 +142,9 @@ class TradingEngine:
             'message':self.health.get('message'),'last_analysis_at':self.health['last_analysis_at'],
             'scan_count':len(self.scan['rows']),'candidate_count':len(self.scan['selected']),
             'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,
-            'position_open':bool(self.store.position())}
+            'position_open':bool(self.store.positions()),'open_positions_count':len(self.store.positions()),
+            'max_positions':cfg.max_positions,'max_trade_risk_pct':cfg.max_trade_risk_pct,
+            'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct}
         log.info('PAPER_STATE %s',json.dumps(state,ensure_ascii=False))
         return state
     def day_state(self,equity,now=None):
@@ -148,96 +155,190 @@ class TradingEngine:
             # choose the higher value to avoid forgiving an observed overnight loss.
             previous=self.store.get('last_equity',equity)
             baseline=max(equity,previous)
-            state={'day':day,'start_equity':baseline,'blocked':False,'baseline_approximation': bool(self.store.position())}
+            state={'day':day,'start_equity':baseline,'blocked':False,'baseline_approximation': bool(self.store.positions())}
         if equity<=state['start_equity']*(1-self.settings().daily_loss_pct/100): state['blocked']=True
         self.store.set('day_state',state)
         return state
-    async def reconcile(self,quote):
-        p=self.store.position()
-        if not p: self.reconciled=True; return
+    def _pending_reconciliation(self):
+        pending=dict(self.store.get('reconcile_pending_by_id',{}))
+        legacy=self.store.get('reconcile_pending')
+        if legacy and str(legacy['id']) not in pending:
+            pending[str(legacy['id'])]=legacy
+        return pending
+    def _set_reconciliation(self,p,ready,pending=None):
+        records=self._pending_reconciliation()
+        live={row['id'] for row in self.store.positions()}
+        if pending is None: records.pop(str(p['id']),None)
+        else: records[str(p['id'])]=pending
+        records={key:value for key,value in records.items() if value['id'] in live}
+        self.store.set('reconcile_pending_by_id',records)
+        # Preserve the old single-position recovery marker during the migration.
+        self.store.set('reconcile_pending',next(iter(records.values()),None))
+        self._position_reconciled[p['id']]=ready
+        self._position_reconciled={key:value for key,value in self._position_reconciled.items() if key in live}
+        self.reconciled=all(self._position_reconciled.get(key,False) for key in live)
+    def _recovery_generation(self):
+        return (self.started_ms,self._settings_revision)
+    @staticmethod
+    def _position_identity(position):
+        return (position['id'],position.get('signal'),position.get('opened_at'))
+    def _recovery_current(self,symbol,identity,generation):
+        current=self.store.position(symbol)
+        return bool(generation==self._recovery_generation() and current and self._position_identity(current)==identity)
+    async def reset_reconciliation_tasks(self):
+        """Cancel old recovery before resetting a wallet whose row IDs can be reused."""
+        tasks=list(self._reconciliation_tasks.values())
+        for task in tasks:task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
+        self._reconciliation_tasks.clear();self._reconciliation_locks.clear()
+        self._position_reconciled={};self.reconciled=not bool(self.store.positions())
+    async def _reconcile_background(self,quote,identity,generation):
+        try:
+            if self._recovery_current(quote.symbol,identity,generation):
+                await self.reconcile(quote,expected_identity=identity,expected_generation=generation)
+        except asyncio.CancelledError:raise
+        except (MarketError,ValueError) as exc:
+            if self._recovery_current(quote.symbol,identity,generation):
+                p=self.store.position(quote.symbol)
+                self._set_reconciliation(p,False,self._pending_reconciliation().get(str(p['id'])))
+                message=f"{quote.symbol}: réconciliation incomplète : {str(exc)[:250]}"
+                self.health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message=message)
+                if message!=self.last_error:
+                    self.store.event(message,'warning');log.warning(message);self.last_error=message
+        except Exception as exc:
+            if generation==self._recovery_generation():self.error(f'Réconciliation suspendue : {type(exc).__name__}')
+        finally:
+            if self._reconciliation_tasks.get(identity[0]) is asyncio.current_task():
+                self._reconciliation_tasks.pop(identity[0],None)
+    async def reconcile(self,quote,expected_identity=None,expected_generation=None):
+        """Awaitable recovery for explicit callers; tick schedules it per position."""
+        p=self.store.position(quote.symbol)
+        if not p:
+            self.reconciled=all(self._position_reconciled.get(row['id'],False) for row in self.store.positions())
+            return
+        identity=expected_identity or self._position_identity(p)
+        generation=self._recovery_generation() if expected_generation is None else expected_generation
+        lock=self._reconciliation_locks.setdefault(identity[0],asyncio.Lock())
+        async with lock:
+            if not self._recovery_current(quote.symbol,identity,generation):return
+            await self._reconcile_position(quote,identity,generation)
+    async def _reconcile_position(self,quote,identity,generation):
+        p=self.store.position(quote.symbol)
+        if not self._recovery_current(quote.symbol,identity,generation):return
         gap=quote.time_ms-p['last_market_at']
-        pending=self.store.get('reconcile_pending')
-        if pending and pending['id']!=p['id']: pending=None
+        pending=self._pending_reconciliation().get(str(p['id']))
         if gap<=15000 and not pending:
-            self.reconciled=True; return
-        if not pending:
-            pending={'id':p['id'],'since':p['last_market_at'],'until':quote.time_ms}
-            self.store.set('reconcile_pending',pending)
-        self.reconciled=False
-        begin=pending['since']//60000*60000
-        end=quote.time_ms
-        seen=[]; cursor=begin
-        # Paginate gaps instead of pretending the most recent 1000 bars cover an outage.
+            self._set_reconciliation(p,True);return
+        if not pending:pending={'id':p['id'],'since':p['last_market_at'],'until':quote.time_ms}
+        self._set_reconciliation(p,False,pending)
+        begin=pending['since']//60000*60000;end=quote.time_ms
+        seen=[];cursor=begin
         for _ in range(45):
             bars=await self.market.candles(p['symbol'],'1m',limit=1000,start_time=cursor,end_time=end)
-            if not bars: break
-            if bars[0].open_time!=cursor: raise MarketError('Réconciliation : premières bougies M1 manquantes.')
-            seen.extend(bars); cursor=bars[-1].close_time+1
-            if cursor+60000>end: break
-        if cursor+60000<=end: raise MarketError('Interruption trop longue ou données M1 incomplètes : entrées bloquées.')
-        quote=await self.market.quote(p['symbol'])
-        self.quotes[p['symbol']]=quote
-        closed=self.paper.reconcile(quote,seen,since_time=pending['since'])
-        self.store.event('Reprise après interruption : M1 vérifiées ; toute touche est marquée comme approximation prudente.','warning')
-        # Retain an unresolved partial minute until Binance publishes its closed M1.
-        # quote protection may advance last_market_at without erasing this gap record.
-        if closed or cursor>pending['until']:
-            self.store.set('reconcile_pending',None)
-            self.reconciled=True
-        else:
-            self.store.set('reconcile_pending',pending)
-            self.reconciled=False
-        if not closed:
-            # Full current M1 is not yet known; no retrospective favorable fill inferred.
-            self.paper.protect(quote,allow_take_profit=self.reconciled)
+            if not self._recovery_current(quote.symbol,identity,generation):return
+            if not bars:break
+            if bars[0].open_time!=cursor:raise MarketError('Réconciliation : premières bougies M1 manquantes.')
+            seen.extend(bars);cursor=bars[-1].close_time+1
+            if cursor+60000>end:break
+        if cursor+60000<=end:raise MarketError('Interruption trop longue ou données M1 incomplètes : entrées bloquées.')
+        fresh=await self.market.quote(p['symbol'])
+        if not self._recovery_current(quote.symbol,identity,generation):return
+        async with self.lock:
+            if not self._recovery_current(quote.symbol,identity,generation):return
+            self.quotes[p['symbol']]=fresh
+            closed=self.paper.reconcile(fresh,seen,since_time=pending['since'])
+            self.store.event('Reprise après interruption : M1 vérifiées ; toute touche est marquée comme approximation prudente.','warning')
+            if closed or cursor>pending['until']:self._set_reconciliation(p,True)
+            else:self._set_reconciliation(p,False,pending)
+            if not closed:
+                self.paper.protect(fresh,allow_take_profit=self._position_reconciled.get(p['id'],False),portfolio_quotes=self.quotes)
+                if not self.store.position(p['symbol']):self._set_reconciliation(p,True)
+    def _protect_observed_quote(self,quote,captured_position):
+        """No I/O or await: protect fresh observed risk before any historic lookup."""
+        current=self.store.position(quote.symbol)
+        if not current or self._position_identity(current)!=self._position_identity(captured_position):return
+        pending=self._pending_reconciliation().get(str(current['id']))
+        needs_history=pending is not None or quote.time_ms-current['last_market_at']>15000
+        if needs_history:
+            if pending is None:pending={'id':current['id'],'since':current['last_market_at'],'until':quote.time_ms}
+            self._set_reconciliation(current,False,pending)
+        else:self._set_reconciliation(current,True)
+        # The pending marker is recorded before protect advances last_market_at.
+        short=current.get('kind')=='cfd' and current.get('direction')=='SHORT'
+        breached=quote.ask>=current['stop_loss'] if short else quote.bid<=current['stop_loss']
+        if needs_history and breached:
+            self.paper.sell(quote,'STOP_REPRISE_DONNEES_INCOMPLETES',{
+                'uncertain':True,'method':'Stop dépassé sur cotation fraîche à la reprise ; historique non encore réconcilié, aucune exécution passée normale supposée.'})
+        else:self.paper.protect(quote,allow_take_profit=not needs_history,portfolio_quotes=self.quotes)
+        if not self.store.position(quote.symbol):
+            if needs_history:
+                rows=self.store.rows('SELECT detail FROM trades WHERE id=?',(current['id'],))
+                if rows:
+                    detail=json.loads(rows[0]['detail']);detail.setdefault('exit',{}).update(uncertain=True,historical_gap_unresolved=True)
+                    self.store.conn.execute('UPDATE trades SET detail=? WHERE id=?',(dumps(detail),current['id']))
+            self._set_reconciliation(current,True);return needs_history
+        if needs_history:
+            task=self._reconciliation_tasks.get(current['id'])
+            if task is None or task.done():
+                identity=self._position_identity(current);generation=self._recovery_generation()
+                self._reconciliation_tasks[current['id']]=asyncio.create_task(self._reconcile_background(quote,identity,generation))
     async def tick(self):
-        cfg=self.settings(); p=self.store.position()
-        symbols=list(dict.fromkeys(cfg.symbols+(['BTCUSDT'])+([p['symbol']] if p else [])))
+        cfg=self.settings(); positions=self.store.positions()
+        held_symbols={p['symbol'] for p in positions}
+        symbols=list(dict.fromkeys([p['symbol'] for p in positions]+cfg.symbols+['BTCUSDT']))
         try:
             now=await self.market.server_time()
             if abs(now-int(time.time()*1000))>5000: raise MarketError('Horloge ordinateur décalée de plus de 5 secondes : synchronisez-la.')
-            fresh=await asyncio.gather(*[self.market.quote(s) for s in symbols],return_exceptions=True)
-            errors=[]
-            for symbol,q in zip(symbols,fresh):
-                if isinstance(q,BaseException): errors.append(f'{symbol}: {q}'); continue
-                previous=self.quotes.get(symbol)
-                if previous and abs(q.bid/previous.bid-1)>.20:
-                    if p and symbol==p['symbol']:
+            captured={p['symbol']:p for p in positions}
+            async def fetch(symbol):
+                try:
+                    quote=await self.market.quote(symbol);gap=False
+                    previous=self.quotes.get(symbol)
+                    if previous and abs(quote.bid/previous.bid-1)>.20:
+                        if symbol not in held_symbols:raise MarketError('Variation incohérente supérieure à 20 %, cotation rejetée.')
                         confirmation=await self.market.quote(symbol)
-                        if abs(confirmation.bid/q.bid-1)>.01:
-                            errors.append(f'{symbol}: cotations de gap contradictoires.');continue
-                        q=confirmation
-                        self.store.event('Gap supérieur à 20 % confirmé sur deux cotations ; protection au cours observé, exécution incertaine.','warning')
-                    else:
-                        errors.append(f'{symbol}: variation incohérente supérieure à 20 %, cotation rejetée.'); continue
-                self.quotes[symbol]=q
-            now=await self.market.server_time() # quotes are timestamped at response receipt, after the first clock read
-            if p:
-                q=self.quotes.get(p['symbol'])
-                if q and 0<=now-q.time_ms<=15000:
-                    async with self.lock:
-                        # Recover any touches during a gap BEFORE checking the current quote.
+                        if abs(confirmation.bid/quote.bid-1)>.01:raise MarketError('Cotations de gap contradictoires.')
+                        quote=confirmation;gap=True
+                    return symbol,quote,gap,None
+                except (MarketError,ValueError) as exc:return symbol,None,False,str(exc)
+            quote_tasks=[asyncio.create_task(fetch(symbol)) for symbol in symbols]
+            errors=[]
+            try:
+                for completed in asyncio.as_completed(quote_tasks):
+                    symbol,q,gap,error=await completed
+                    if error is not None:
+                        errors.append(f'{symbol}: {error}')
+                        p=self.store.position(symbol)
+                        if p and symbol in captured and self._position_identity(p)==self._position_identity(captured[symbol]):
+                            self._set_reconciliation(p,False,self._pending_reconciliation().get(str(p['id'])))
+                        continue
+                    if not 0<=int(time.time()*1000)-q.time_ms<=15000:
+                        errors.append(f'{symbol}: Cotation périmée.');continue
+                    self.quotes[symbol]=q
+                    if gap:self.store.event('Gap supérieur à 20 % confirmé sur deux cotations ; protection au cours observé, exécution incertaine.','warning')
+                    if symbol in captured:
                         try:
-                            await self.reconcile(q)
-                        except MarketError:
-                            # A fresh observed breached stop remains actionable even if
-                            # historic M1 is missing. No favorable TP is inferred here.
-                            observed=await self.market.quote(p['symbol'])
-                            self.quotes[p['symbol']]=observed
-                            held=self.store.position()
-                            if held and held['symbol'].startswith('CAP:'):
-                                self.paper.protect(observed,allow_take_profit=False)
-                            elif held and observed.bid<=held['stop_loss']:
-                                self.paper.sell(observed,'STOP_REPRISE_DONNEES_INCOMPLETES',{'uncertain':True,'method':'Stop dépassé au bid frais observé, historique indisponible ; aucune exécution normale supposée.'})
-                            raise
-                        self.paper.protect(self.quotes[p['symbol']],allow_take_profit=self.reconciled)
-                else: self.reconciled=False
-            else: self.reconciled=True
+                            if self._protect_observed_quote(q,captured[symbol]):
+                                errors.append(f'{symbol}: sortie à la reprise sur données historiques incomplètes.')
+                        except (MarketError,ValueError) as exc:
+                            errors.append(f'{symbol}: protection indisponible : {exc}')
+                            p=self.store.position(symbol)
+                            if p:self._set_reconciliation(p,False,self._pending_reconciliation().get(str(p['id'])))
+            finally:
+                outstanding=[task for task in quote_tasks if not task.done()]
+                for task in outstanding:task.cancel()
+                await asyncio.gather(*outstanding,return_exceptions=True)
+            # Give completed recovery jobs a chance to publish their readiness;
+            # never wait for a slow M1 provider here.
+            await asyncio.sleep(0)
+            live=self.store.positions()
+            self.reconciled=all(self._position_reconciled.get(p['id'],False) for p in live)
+            if live and not self.reconciled:raise MarketError('Historique incomplet sur une position : nouvelles entrées suspendues.')
             cfd_available=cfg.cfd_enabled and getattr(getattr(self.market,'capital',None),'configured',False)
-            if errors and (not cfd_available or (p and any(e.startswith(p['symbol']+':') for e in errors))):
+            if errors and (not cfd_available or any(any(e.startswith(symbol+':') for symbol in held_symbols) for e in errors)):
                 raise MarketError('; '.join(errors))
-            now=await self.market.server_time()
-            required=[p['symbol']] if p and cfd_available else ([] if cfd_available else symbols)
+            now=int(time.time()*1000)
+            required=list(held_symbols) if cfd_available else symbols
             if not all(s in self.quotes and 0<=now-self.quotes[s].time_ms<=15000 for s in required): raise MarketError('Cotations périmées.')
             self.health.update(market_ok=True,last_quote_at=utcnow())
             if not self.store.get('btc_baseline') and 'BTCUSDT' in self.quotes:
@@ -288,129 +389,115 @@ class TradingEngine:
             self.health['ai_error']=message
     async def _analyze(self):
         cfg=self.settings(); revision=self._settings_revision
-        if not self.health['market_ok']: return
+        held=self.store.positions()
+        if not self.health['market_ok'] and not held: return
         now=await self.market.server_time()
         expected=(now//300000)*300000-1
-        # Never produce a virtual trade on a candle closed before this process started.
         if expected<self.started_ms: return
         key=f'm5:{expected}'
         if self.store.get('last_cycle')==key: return
-        symbols = cfg.symbols
-        expanded = cfg.auto_scanner or cfg.cfd_enabled
-        slots_by_provider = {'crypto': asyncio.Semaphore(2), 'cfd': asyncio.Semaphore(2)}
+        expanded=cfg.auto_scanner or cfg.cfd_enabled
+        slots={'crypto':asyncio.Semaphore(2),'cfd':asyncio.Semaphore(2)}
         async def market_context(symbol):
-            async with slots_by_provider['cfd' if symbol.startswith('CAP:') else 'crypto']:
+            async with slots['cfd' if symbol.startswith('CAP:') else 'crypto']:
+                quote=await self.market.quote(symbol)
+                previous=self.quotes.get(symbol)
+                if previous and abs(quote.bid/previous.bid-1)>.20:
+                    raise MarketError('Variation incohérente supérieure à 20 %.')
+                self.quotes[symbol]=quote
                 if expanded:
-                    quote = await self.market.quote(symbol)
-                    previous = self.quotes.get(symbol)
-                    if previous and abs(quote.bid / previous.bid - 1) > .20:
-                        raise MarketError('Variation incohérente supérieure à 20 %.')
-                    self.quotes[symbol] = quote
-                    m5 = await self.market.candles(symbol, '5m', 150)
-                    expected_h1 = (now//3600000)*3600000-1
-                    cached = self._h1.get(symbol)
-                    h1 = cached if cached and cached[-1].close_time == expected_h1 else await self.market.candles(symbol, '1h', 150)
-                    self._h1[symbol] = h1
+                    m5=await self.market.candles(symbol,'5m',150)
+                    expected_h1=(now//3600000)*3600000-1
+                    cached=self._h1.get(symbol)
+                    h1=cached if cached and cached[-1].close_time==expected_h1 else await self.market.candles(symbol,'1h',150)
+                    self._h1[symbol]=h1
                 else:
                     m5,h1=await asyncio.gather(self.market.candles(symbol,'5m',150),self.market.candles(symbol,'1h',150))
                 if not m5 or m5[-1].close_time!=expected or (await self.market.server_time())-m5[-1].close_time>45000:
                     raise MarketError('Bougie M5 absente ou trop ancienne pour une entrée.')
-                expected_h1=(now//3600000)*3600000-1
-                if not h1 or h1[-1].close_time!=expected_h1: raise MarketError('Données H1 trop anciennes.')
+                if not h1 or h1[-1].close_time!=(now//3600000)*3600000-1:
+                    raise MarketError('Données H1 trop anciennes.')
                 a,b=snapshot(m5),snapshot(h1)
-                q = self.quotes[symbol]
-                setups = candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
-                shorts = short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
-                spread = (q.ask-q.bid)/q.bid*10000
-                if spread > cfg.max_spread_bps or a['atr_pct'] > cfg.max_atr_pct:
-                    setups = []; shorts = []
-                directions = (['BUY'] if setups else []) + (['SHORT'] if shorts else [])
-                return symbol,{'m5':a,'h1':b,'quote':asdict(q),'directions':directions,
+                setups=candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
+                shorts=short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
+                spread=(quote.ask-quote.bid)/quote.bid*10000
+                if spread>cfg.max_spread_bps or a['atr_pct']>cfg.max_atr_pct:
+                    setups=[];shorts=[]
+                data={'m5':a,'h1':b,'quote':asdict(quote),
+                    'directions':(['BUY'] if setups else [])+(['SHORT'] if shorts else []),
                     'direction_candidates':{'BUY':setups,'SHORT':shorts},
-                    'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else '; '.join(long_refusals(a,b)) if not symbol.startswith('CAP:') and not setups else None),
-                    'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'}},list(dict.fromkeys(setups+shorts))
+                    'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'},
+                    'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else '; '.join(long_refusals(a,b)) if not symbol.startswith('CAP:') and not setups else None)}
+                # Market references come first. Never derive an objective from a
+                # desired multiple and then ask the model to justify that price.
+                data['structure']={side:structural_levels(data,entry=quote.ask if side=='BUY' else quote.bid,
+                    direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1)
+                    for side in data['directions']}
+                return symbol,data,list(dict.fromkeys(setups+shorts))
         try:
-            if expanded:
-                if cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
-                    try:
-                        self._universe = await self.market.liquid_symbols(cfg.scanner_limit)
-                        self._universe_at = time.monotonic()
-                    except MarketError:
-                        if not cfg.cfd_enabled: raise
-                        self._universe=[]
-                held = self.store.position()
-                crypto_symbols = self._universe if cfg.auto_scanner else cfg.symbols
-                cfd_symbols = await self.market.cfd_symbols(cfg.cfd_scan_limit) if cfg.cfd_enabled and hasattr(self.market,'cfd_symbols') else []
-                symbols = list(dict.fromkeys(crypto_symbols + cfd_symbols + ([held['symbol']] if held else [])))
-                if held: symbols=[held['symbol']]+[s for s in symbols if s!=held['symbol']]
-
-                # Slow or unavailable symbols must not consume the entire fresh
-                # entry window and prevent ready markets from being evaluated.
-                tasks={symbol:asyncio.create_task(market_context(symbol)) for symbol in symbols}
+            if cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
                 try:
+                    self._universe=await self.market.liquid_symbols(cfg.scanner_limit)
+                    self._universe_at=time.monotonic()
+                except MarketError:
+                    if not cfg.cfd_enabled: raise
+                    self._universe=[]
+            crypto=self._universe if cfg.auto_scanner else cfg.symbols
+            cfd=await self.market.cfd_symbols(cfg.cfd_scan_limit) if cfg.cfd_enabled and hasattr(self.market,'cfd_symbols') else []
+            held_symbols={p['symbol'] for p in held}
+            symbols=list(dict.fromkeys([p['symbol'] for p in held]+crypto+cfd))
+            tasks={symbol:asyncio.create_task(market_context(symbol)) for symbol in symbols}
+            try:
+                if expanded:
                     remaining=max(0.,min(30.,(expected+43000-await self.market.server_time())/1000))
                     done,pending=await asyncio.wait(list(tasks.values()),timeout=remaining)
                     for task in pending: task.cancel()
                     await asyncio.gather(*pending,return_exceptions=True)
-                    raw=[]
-                    for symbol in symbols:
-                        task=tasks[symbol]
-                        if task in pending: raw.append(MarketError('Délai de scan dépassé ; marché ignoré pour ce cycle.'))
-                        else:
-                            try: raw.append(task.result())
-                            except Exception as exc: raw.append(exc)
-                finally:
-                    outstanding=[t for t in tasks.values() if not t.done()]
-                    for task in outstanding: task.cancel()
-                    await asyncio.gather(*outstanding,return_exceptions=True)
-                rows=[]; valid=[]
-                for symbol, item in zip(symbols, raw):
-                    if isinstance(item, BaseException):
-                        rows.append({'symbol':symbol,'status':'INDISPONIBLE','reason':str(item)[:180],**(self.market.describe(symbol) if hasattr(self.market,'describe') else {})})
-                        if held and held['symbol']==symbol: raise MarketError('Analyse de la position ouverte indisponible.')
+                else:
+                    await asyncio.gather(*tasks.values(),return_exceptions=True)
+                    pending=set()
+                rows=[];valid=[];held_errors=[]
+                for symbol,task in tasks.items():
+                    try:
+                        if task in pending: raise MarketError('Délai de scan dépassé ; marché ignoré pour ce cycle.')
+                        item=task.result()
+                    except (Exception,asyncio.CancelledError) as exc:
+                        rows.append({'symbol':symbol,'status':'INDISPONIBLE','reason':str(exc)[:180],
+                            **(self.market.describe(symbol) if hasattr(self.market,'describe') else {})})
+                        if symbol in held_symbols: held_errors.append(symbol)
                     else:
                         valid.append(item)
-                        rows.append({'symbol':symbol,**item[1]['instrument'],'status':'CANDIDAT' if item[2] else 'ATTENTE',
+                        rows.append({'symbol':symbol,**item[1]['instrument'],'status':'CANDIDAT' if item[2] and symbol not in held_symbols else 'POSITION OUVERTE' if symbol in held_symbols else 'ATTENTE',
                             'reason':', '.join(item[2]) or item[1].get('filter_reason') or 'Critères techniques, spread ou volatilité non réunis.'})
-                if not valid: raise MarketError('Aucun marché analysable sur ce cycle.')
-                ranked=sorted((r for r in valid if r[2]), key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
-                results=ranked[:cfg.ai_shortlist]
-                if cfg.cfd_enabled:
-                    # Volume is not comparable between OTC CFDs and exchange
-                    # crypto. Give each ready family a place, rotating ties.
-                    families={}
-                    for item in ranked:
-                        family=item[1]['instrument'].get('asset_class','unknown')
-                        families.setdefault(family,[]).append(item)
-                    order=list(families)
-                    if order:
-                        offset=(expected//300000)%len(order)
-                        order=order[offset:]+order[:offset]
-                        results=[]
-                        while order and len(results)<cfg.ai_shortlist:
-                            next_order=[]
-                            for family in order:
-                                if families[family] and len(results)<cfg.ai_shortlist:
-                                    results.append(families[family].pop(0))
-                                if families[family]: next_order.append(family)
-                            order=next_order
-                if held:
-                    results=[r for r in valid if r[0]==held['symbol']]+[r for r in results if r[0]!=held['symbol']]
-                self.scan={'at':utcnow(),'rows':rows,'selected':[r[0] for r in results],'error':None}
-                if not results:
-                    if self.store.claim_signal(key):
-                        self.store.set('last_cycle',key)
-                        self.store.decision(wait('Aucune configuration admissible après scan ; aucun appel IA facturé.'),None,{'scanner':self.scan,'closed_candle_ms':expected})
-                        self.health['last_analysis_at']=self.store.get('last_analysis_at')
-                    return
-                cfg=cfg.model_copy(update={'symbols':[r[0] for r in results]})
-                # Only the shortlist needs detailed exchange filters and AI payloads.
-                for _, data, _ in results:
-                    data['m5']['candles']=data['m5']['candles'][-22:]
-                    data['h1']['candles']=data['h1']['candles'][-12:]
-            else:
-                results=await asyncio.gather(*[market_context(s) for s in cfg.symbols])
-            rules=await self.market.rules([r[0] for r in results]); self.rules.update(rules)
+            finally:
+                outstanding=[t for t in tasks.values() if not t.done()]
+                for task in outstanding: task.cancel()
+                await asyncio.gather(*outstanding,return_exceptions=True)
+            if not valid:
+                messages='; '.join(row['reason'] for row in rows[:3])
+                raise MarketError('Aucun marché analysable sur ce cycle. '+messages)
+            ranked=sorted((r for r in valid if r[2] and r[0] not in held_symbols),key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
+            entry_results=ranked[:cfg.ai_shortlist] if expanded else [r for r in valid if r[0] not in held_symbols]
+            if expanded and cfg.cfd_enabled:
+                families={}
+                for item in ranked: families.setdefault(item[1]['instrument'].get('asset_class','unknown'),[]).append(item)
+                order=list(families)
+                if order:
+                    offset=(expected//300000)%len(order);order=order[offset:]+order[:offset]
+                    entry_results=[]
+                    while order and len(entry_results)<cfg.ai_shortlist:
+                        next_order=[]
+                        for family in order:
+                            if families[family] and len(entry_results)<cfg.ai_shortlist: entry_results.append(families[family].pop(0))
+                            if families[family]: next_order.append(family)
+                        order=next_order
+            ready_held=[p for p in held if any(r[0]==p['symbol'] for r in valid)]
+            cursor=self.store.get('last_managed_position_id',0)
+            managed=next((p for p in ready_held if p['id']>cursor),ready_held[0] if ready_held else None)
+            selected=[r[0] for r in entry_results]+([managed['symbol']] if managed else [])
+            self.scan={'at':utcnow(),'rows':rows,'selected':list(dict.fromkeys(selected)),
+                'error':'Analyse indisponible pour '+', '.join(held_errors) if held_errors else None}
+            self.rules.update(await self.market.rules([r[0] for r in entry_results]))
         except Exception as exc:
             self.scan['error']=str(exc)[:400]
             self.health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message=f'Analyse bloquée : {str(exc)[:400]}')
@@ -422,98 +509,170 @@ class TradingEngine:
             return
         async with self.lock:
             if not self.store.claim_signal(key):
-                self.store.set('last_cycle',key); return
+                self.store.set('last_cycle',key);return
             self.store.set('last_cycle',key)
-        stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
-        context={'directions':{s:data.get('directions',[]) for s,data,_ in results},
-            'direction_candidates':{s:data.get('direction_candidates',{}) for s,data,_ in results},
-            'scanner':self.scan if expanded else None,'at_utc':utcnow(),'closed_candle_ms':expected,'symbols':cfg.symbols,
-            'markets':{s:data for s,data,_ in results},'candidates':{s:setups for s,_,setups in results},
-            'positions':[p] if p else [],'cash':stats['cash'],'equity':stats['equity'],
-            'daily_pnl':stats['equity']-day['start_equity'],'rules':cfg.model_dump(),
-            'entries_paused':self.store.get('mode')!='running' or day['blocked']}
-        # Give the model explicit cost geometry. These are cost illustrations,
-        # never a new signal or permission to bypass a structural stop.
-        for symbol,data,_ in results:
-            if symbol.startswith('CAP:'): continue
-            from math import ceil
-            q=self.quotes[symbol]; rule=self.rules[symbol]
-            slip=cfg.slippage_bps/10000; factor=(1-slip)*(1-cfg.fee_rate)
-            fill=q.ask*(1+slip); examples=[]
-            for source,raw_stop in [('recent_low',data['m5']['recent_low']-.1*data['m5']['atr14']),('support',data['m5']['support']-.1*data['m5']['atr14'])]:
-                from .risk import floor_step
-                stop=floor_step(raw_stop,rule.tick_size)
-                distance=fill-stop;atr=data['m5']['atr14']
-                if not .35*atr<=distance<=4*atr: continue
-                loss=fill*(1+cfg.fee_rate)-stop*factor
-                required=(fill*(1+cfg.fee_rate)+cfg.min_rr*loss)/factor
-                target=ceil(required/rule.tick_size)*rule.tick_size
-                examples.append({'structural_reference':source,'stop':stop,'minimum_take_profit_for_net_rr':target,'net_rr_required':cfg.min_rr})
-            data['cost_geometry']={'currency':'USDT','estimated_entry_fill':fill,
-                'break_even_exit_before_exit_slippage':fill*(1+cfg.fee_rate)/factor,
-                'invalidation_constraint':'stop_loss <= invalidation < entry',
-                'examples_not_signals':examples,'note':'Un objectif inférieur au seuil net ne respecte pas le risque ; aucun exemple ne garantit un niveau structurel ou un gain.'}
-        # Strip older nested AI histories so tokens stay bounded over many trades.
-        if p: context['positions']=[{k:v for k,v in p.items() if k not in {'detail'}}]
-        reserve=sum(len(v.encode('utf-8')) for v in (dumps(context),SYSTEM_PROMPT,dumps(Decision.model_json_schema())))+MAX_OUTPUT_TOKENS+1000 # Conservative byte upper bound and protocol allowance.
+            if managed: self.store.set('last_managed_position_id',managed['id'])
+        stats,_=statistics(self.store,self.quotes);day=self.day_state(stats['equity'])
+        positions=[{k:v for k,v in p.items() if k!='detail'} for p in stats['positions']]
+        used=portfolio_remaining_risk(self.store.positions(),self.quotes,now_ms=int(time.time()*1000))
+        import math
+        risk_known=math.isfinite(used)
+        remaining_day=max(0,day['start_equity']*cfg.daily_loss_pct/100+(stats['equity']-day['start_equity']))
+        available=max(0,min(stats['equity']*cfg.max_portfolio_risk_pct/100,remaining_day)-used) if risk_known else 0.
+        portfolio={'open_count':len(positions),'max_positions':cfg.max_positions,'risk_known':risk_known,
+            'risk_used_usdt':used if risk_known else None,'risk_available_usdt':available,
+            'max_trade_risk_pct':cfg.max_trade_risk_pct,'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct}
+        base={'at_utc':utcnow(),'closed_candle_ms':expected,'cash':stats['cash'],'equity':stats['equity'],
+            'daily_pnl':stats['equity']-day['start_equity'],'portfolio':portfolio,
+            'entries_paused':self.store.get('mode')!='running' or day['blocked'],
+            'scanner':{'at':self.scan['at'],'selected':self.scan['selected']} if expanded else None}
+        def context_for(results,mode,target=None):
+            import copy
+            markets={s:copy.deepcopy(data) for s,data,_ in results}
+            for data in markets.values():
+                data['m5']['candles']=data['m5']['candles'][-22:]
+                data['h1']['candles']=data['h1']['candles'][-12:]
+            symbols=[r[0] for r in results]
+            context={**base,'mode':mode,'symbols':symbols,'rules':cfg.model_copy(update={'symbols':symbols}).model_dump(),
+                'markets':markets,'candidates':{s:setups for s,_,setups in results},
+                'directions':{s:data['directions'] for s,data,_ in results},
+                'direction_candidates':{s:data['direction_candidates'] for s,data,_ in results},
+                'positions':[p for p in positions if not target or p['symbol']==target]}
+            if target: context['managed_symbol']=target
+            return context
+        calls=[]
+        if managed:
+            results=[r for r in valid if r[0]==managed['symbol']]
+            calls.append((context_for(results,'management',managed['symbol']),{r[0]:r[1] for r in results}))
+        entry_ready=(entry_results and any(r[2] for r in entry_results) and len(positions)<cfg.max_positions
+            and available>0 and not base['entries_paused'] and self.health['market_ok'] and self.reconciled and not held_errors)
+        if entry_ready:
+            calls.append((context_for(entry_results,'entry'),{r[0]:r[1] for r in entry_results}))
+        if not calls:
+            reason=('Aucune configuration admissible après scan ; aucun appel IA facturé.' if not ranked else
+                'Nouvelles entrées suspendues : capacité, risque disponible, pause ou données insuffisantes.')
+            self.store.decision(wait(reason),None,{'scanner':self.scan,'closed_candle_ms':expected,'portfolio':portfolio})
+            self.health['last_analysis_at']=self.store.get('last_analysis_at')
+            return
+        # Management reserves its budget first. Parallel calls keep entry quotes
+        # inside the same fresh M5 window; all execution is rechecked under lock.
+        outcomes=await asyncio.gather(*(self._decide_and_execute(context,raw,cfg,revision,expected,key,day['day']) for context,raw in calls))
+        errors=[outcome for outcome in outcomes if outcome['error']]
+        if errors:
+            # A successful entry response must not hide a rejected management
+            # response (or vice versa). Keep operational faults ahead of a
+            # malformed decision, and preserve both messages in the diagnostic.
+            errors.sort(key=lambda outcome:outcome['error_kind']=='invalid_decision')
+            messages=list(dict.fromkeys(outcome['error'] for outcome in errors))
+            self.health.update(ai_ok=False,ai_error=' ; '.join(messages),ai_error_kind=errors[0]['error_kind'])
+        else:
+            self.health.update(ai_ok=True,ai_error=None,ai_error_kind=None)
+
+    async def _decide_and_execute(self,context,raw_markets,cfg,revision,expected,key,day):
+        reserve=sum(len(v.encode('utf-8')) for v in (dumps(context),SYSTEM_PROMPT,dumps(Decision.model_json_schema())))+MAX_OUTPUT_TOKENS+1000
         if not self.env.api_key and not getattr(self.ai,'test_enabled',False):
             result=await self.ai.decide(context)
-        elif not self.store.reserve_usage(day['day'],cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
-            decision=Decision(symbol='ALL',action='WAIT',reason='Plafond API quotidien atteint.',entry=None,stop_loss=None,take_profit=None,invalidation=None,confirmation='Aucun appel API autorisé.',risks=['Budget API'],setup='none',confirmation_met=False)
-            self.store.decision(decision,'Budget API épuisé',{'context':context})
-            self.health.update(ai_ok=False,ai_error='Plafond API quotidien atteint : WAIT.'); return
+        elif not self.store.reserve_usage(day,cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
+            self.store.decision(wait('Plafond API quotidien atteint.'),'Budget API épuisé',{'context':context})
+            self.health.update(ai_ok=False,ai_error='Plafond API quotidien atteint : WAIT.',ai_error_kind='limits')
+            return {'error':'Plafond API quotidien atteint : WAIT.','error_kind':'limits'}
         else:
             self.ai.model=cfg.model
             result=await self.ai.decide(context)
-            self.store.settle_usage(day['day'],reserve,result.input_tokens+result.output_tokens)
-        rejection=result.error; decision=result.decision
+            self.store.settle_usage(day,reserve,result.input_tokens+result.output_tokens)
+        decision=result.decision;rejection=result.error
         detail={'context':context,'proposal':decision.model_dump(),'api_error':result.error,'model':cfg.model,
-                'usage':{'input_tokens':result.input_tokens,'output_tokens':result.output_tokens}}
-        error_kind=getattr(result,'error_kind',None)
-        diagnostic=getattr(result,'diagnostic',None)
+            'usage':{'input_tokens':result.input_tokens,'output_tokens':result.output_tokens}}
+        kind=getattr(result,'error_kind',None);diagnostic=getattr(result,'diagnostic',None)
         if diagnostic: detail['ai_diagnostic']=diagnostic
-        self.health.update(ai_ok=not bool(result.error),ai_error=result.error,ai_error_kind=error_kind)
+        outcome={'error':result.error,'error_kind':kind or ('operational' if result.error else None)}
         if result.error:
-            self.store.event(result.error,'warning' if error_kind=='invalid_decision' else 'error')
+            # Show failures immediately, but clear them only after every call in
+            # this cycle has completed and its outcome has been aggregated.
+            self.health.update(ai_ok=False,ai_error=result.error,ai_error_kind=outcome['error_kind'])
+            self.store.event(result.error,'warning' if kind=='invalid_decision' else 'error')
             log.warning('PAPER_AI_REJECTION %s',json.dumps({'at':utcnow(),'closed_candle_ms':expected,
-                'error_kind':error_kind,'diagnostic':diagnostic},ensure_ascii=False))
+                'mode':context['mode'],'error_kind':kind,'diagnostic':diagnostic},ensure_ascii=False))
+        entry=decision.action in {'BUY','SHORT'}
+        expected_target=next((p for p in context.get('positions',[]) if p.get('symbol')==decision.symbol),None)
+        target_identity=self._position_identity(expected_target) if expected_target and 'id' in expected_target else None
+        fetched_rules={};q=None;io_rejection=None
+        try:
+            if result.error:raise RiskRejected(result.error)
+            validate_context(decision,context)
+            if decision.action in {'BUY','SHORT','SELL'}:
+                if decision.symbol not in context['markets']:raise RiskRejected('Marché absent de la sélection analysée.')
+                if entry:
+                    # Metadata may require network I/O; protection never waits
+                    # behind the global accounting lock while it is fetched.
+                    fetched_rules=await self.market.rules([decision.symbol])
+                q=await self.market.quote(decision.symbol)
+                if decision.action=='SELL':
+                    live=self.store.position(decision.symbol)
+                    if target_identity is None or not live or self._position_identity(live)!=target_identity:
+                        raise RiskRejected('Position de gestion clôturée ou remplacée pendant l’analyse.')
+                    await self.reconcile(q,expected_identity=target_identity,
+                        expected_generation=(self.started_ms,revision))
+                    q=self.quotes.get(decision.symbol,q)
+        except (ValueError,MarketError) as exc:io_rejection=str(exc)
         async with self.lock:
+            # All mutation/validation below is synchronous: fresh stops on other
+            # positions cannot wait for broker or history requests.
             try:
-                if result.error: raise RiskRejected(result.error)
-                if expected<self.started_ms: raise RiskRejected('Cycle antérieur au dernier démarrage : décision annulée.')
-                if revision!=self._settings_revision: raise RiskRejected('Paramètres modifiés pendant l’analyse ; décision annulée.')
-                if self.store.get('mode')=='stopped': raise RiskRejected('Analyses arrêtées pendant l’appel IA.')
-                if not self.health['market_ok'] or not self.reconciled: raise RiskRejected('Données indisponibles ou réconciliation incomplète.')
-                # Fresh quote AFTER the potentially slow AI call. Do not execute on its input price.
+                if io_rejection:raise RiskRejected(io_rejection)
+                validate_context(decision,context)
+                if self.critical_error:raise RiskRejected('Moteur suspendu : décision annulée.')
+                if expected<self.started_ms:raise RiskRejected('Cycle antérieur au dernier démarrage : décision annulée.')
+                if revision!=self._settings_revision:raise RiskRejected('Paramètres modifiés pendant l’analyse ; décision annulée.')
+                if self.store.get('mode')=='stopped':raise RiskRejected('Analyses arrêtées pendant l’appel IA.')
+                if context.get('mode')=='management':
+                    live=self.store.position(decision.symbol)
+                    if target_identity is None or not live or self._position_identity(live)!=target_identity:
+                        raise RiskRejected('Position de gestion clôturée ou remplacée pendant l’analyse.')
+                if entry and (not self.health['market_ok'] or not self.reconciled):
+                    raise RiskRejected('Données indisponibles ou réconciliation incomplète.')
                 if decision.action in {'BUY','SHORT','SELL'}:
-                    if decision.symbol not in context['markets']: raise RiskRejected('Marché absent de la sélection analysée.')
-                    if decision.action in {'BUY','SHORT'}:
-                        if decision.symbol.startswith('CAP:') and self.provider_setup: raise RiskRejected('Connexion de données en cours de modification.')
-                        if decision.action not in context['directions'].get(decision.symbol,[]): raise RiskRejected('Direction non admissible selon le scanner.')
-                        if decision.setup not in context['direction_candidates'].get(decision.symbol,{}).get(decision.action,[]): raise RiskRejected('Configuration non admissible pour cette direction.')
-                        # Finish metadata I/O before the final executable quote.
-                        self.rules.update(await self.market.rules([decision.symbol]))
-                    q=await self.market.quote(decision.symbol); self.quotes[decision.symbol]=q
+                    if q is None:raise RiskRejected('Cotation exécutable absente.')
+                    self.quotes[decision.symbol]=q
                     detail['execution_quote']={'bid':q.bid,'ask':q.ask,'time_ms':q.time_ms}
-                    if q.time_ms-expected>65000: raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
-                    stats,p=statistics(self.store,self.quotes); day=self.day_state(stats['equity'])
-                    if decision.action in {'BUY','SHORT'}:
-                        remaining=max(0,day['start_equity']*cfg.daily_loss_pct/100+(stats['equity']-day['start_equity']))
-                        sized_cfg=cfg.model_copy(update={'risk_pct':min(cfg.risk_pct,remaining/max(stats['equity'],1e-12)*100)})
-                        plan=RiskEngine.plan(decision,q,self.rules[decision.symbol],sized_cfg,stats['cash'],stats['equity'],p,
-                            paused=self.store.get('mode')!='running',day_blocked=day['blocked'],atr=context['markets'][decision.symbol]['m5']['atr14'],now_ms=int(time.time()*1000))
-                        self.paper.buy(plan,q,key,decision,cfg,{**detail,'plan':asdict(plan)})
+                    if entry and q.time_ms-expected>65000:raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
+                    if entry:
+                        if decision.symbol.startswith('CAP:') and self.provider_setup:raise RiskRejected('Connexion de données en cours de modification.')
+                        if decision.action not in context['directions'].get(decision.symbol,[]):raise RiskRejected('Direction non admissible selon le scanner.')
+                        if decision.setup not in context['direction_candidates'].get(decision.symbol,{}).get(decision.action,[]):raise RiskRejected('Configuration non admissible pour cette direction.')
+                        self.rules.update(fetched_rules)
+                    stats,_=statistics(self.store,self.quotes);current_day=self.day_state(stats['equity'])
+                    held=self.store.positions()
+                    if entry:
+                        import math
+                        used=portfolio_remaining_risk(held,self.quotes,now_ms=int(time.time()*1000))
+                        if not math.isfinite(used):raise RiskRejected('Risque des positions ouvertes indisponible : aucune nouvelle entrée.')
+                        remaining=max(0,current_day['start_equity']*cfg.daily_loss_pct/100+(stats['equity']-current_day['start_equity']))
+                        budget=max(0,min(remaining,stats['equity']*cfg.max_portfolio_risk_pct/100)-used)
+                        execution_cfg=cfg.model_copy(update={'symbols':context['symbols']})
+                        structure_context=raw_markets[decision.symbol]
+                        plan=RiskEngine.plan(decision,q,self.rules[decision.symbol],execution_cfg,stats['cash'],stats['equity'],
+                            paused=self.store.get('mode')!='running',day_blocked=current_day['blocked'],
+                            atr=structure_context['m5']['atr14'],now_ms=int(time.time()*1000),structure_context=structure_context,
+                            portfolio_positions=held,portfolio_quotes=self.quotes,risk_budget_pct=budget/max(stats['equity'],1e-12)*100)
+                        detail['structure_context']={'m5':structure_context['m5'],'h1':structure_context['h1']}
+                        self.paper.buy(plan,q,f'{key}:{decision.symbol}',decision,cfg,{**detail,'plan':asdict(plan)})
+                        opened=self.store.position(decision.symbol)
+                        if opened:self._set_reconciliation(opened,True)
                     else:
-                        if not p or p['symbol']!=decision.symbol: raise RiskRejected('SELL sans actif détenu interdit.')
-                        await self.reconcile(q)
-                        if self.store.position(): self.paper.sell(q,'SIGNAL_IA',detail)
+                        live=self.store.position(decision.symbol)
+                        if not live or target_identity is None or self._position_identity(live)!=target_identity:
+                            raise RiskRejected('Position de gestion clôturée ou remplacée pendant l’analyse.')
+                        self.paper.sell(q,'SIGNAL_IA',detail)
+                        self._set_reconciliation(live,True)
                 elif decision.action=='HOLD':
-                    if not self.store.position(): raise RiskRejected('HOLD sans position : aucun ordre.')
-            except (ValueError,MarketError) as exc: rejection=str(exc)
+                    if not self.store.position(decision.symbol):raise RiskRejected('HOLD sans position : aucun ordre.')
+            except (ValueError,MarketError) as exc:rejection=str(exc)
             self.store.decision(decision,rejection,detail)
             if decision.action in {'BUY','SHORT','SELL'}:
-                reviewed_quote=self.quotes.get(decision.symbol)
+                reviewed=self.quotes.get(decision.symbol)
                 log.info('PAPER_ORDER_REVIEW %s',json.dumps({'at':self.store.get('last_analysis_at'),
-                    'symbol':decision.symbol,'action':decision.action,'rejection':rejection,'signal_id':key,
-                    'quote_age_ms':int(time.time()*1000)-reviewed_quote.time_ms if reviewed_quote else None},ensure_ascii=False))
+                    'symbol':decision.symbol,'action':decision.action,'mode':context['mode'],'rejection':rejection,
+                    'signal_id':key,'quote_age_ms':int(time.time()*1000)-reviewed.time_ms if reviewed else None},ensure_ascii=False))
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
+        return outcome

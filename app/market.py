@@ -119,13 +119,19 @@ class BinanceClient:
         for attempt in range(3):
             try:
                 async with self._request_lock:
-                    # Bound bursts independently of retry handling, comfortably below public quotas.
-                    delay = .06 - (time.monotonic() - self._last_request)
+                    # Pace departures (at most 16 per second), never hold up
+                    # other positions while one metadata response is in flight.
+                    if time.monotonic() < self._retry_at:
+                        raise MarketError("Binance impose une pause de requêtes ; reconnexion différée.")
+                    delay = .065 - (time.monotonic() - self._last_request)
                     if delay > 0:
                         await asyncio.sleep(delay)
+                    # An in-flight request may have received a 429 during pacing.
+                    if time.monotonic() < self._retry_at:
+                        raise MarketError("Binance impose une pause de requêtes ; reconnexion différée.")
                     started = time.monotonic()
-                    response = await self.client.get(f"{self.base_url}/api/v3/{endpoint}", params=params)
-                    self._last_request = time.monotonic()
+                    self._last_request = started
+                response = await self.client.get(f"{self.base_url}/api/v3/{endpoint}", params=params)
                 if time.monotonic() - started > 15:
                     raise MarketError("Réponse Binance trop lente ; cotation rejetée.")
                 if response.status_code in {418, 429}:

@@ -8,6 +8,7 @@ from app.execution import PaperExecutionEngine, cfd_valuation
 from app.market import Candle
 from app.metrics import statistics
 from app.risk import RiskEngine, RiskRejected
+from test_structural_risk import structural_plan
 from app.storage import Store
 
 SYMBOL='CAP:TEST'
@@ -42,7 +43,7 @@ def book(tmp_path):
 
 def open_position(book,short=False,**setting_changes):
     db,engine=book;c=cfg(**setting_changes);q=quote();d=proposal(short)
-    plan=RiskEngine.plan(d,q,rules(),c,db.get('cash'),900.,atr=1.)
+    plan=structural_plan(d,q,rules(),c,db.get('cash'),900.,atr=1.)
     engine.buy(plan,q,'fixture',d,c,{'fixture':True})
     return plan,c,q
 
@@ -78,22 +79,22 @@ def test_stop_and_target_execute_adverse_side(book,short,stop_bid,stop_ask,targe
 
 @pytest.mark.parametrize('kwargs',[{'cfd_enabled':False},{'cfd_leverage':6},{'risk_pct':2}])
 def test_disabled_or_unsafe_risk_rejected(kwargs):
-    with pytest.raises(RiskRejected): RiskEngine.plan(proposal(),quote(),rules(),cfg(**kwargs),900.,900.,atr=1.)
+    with pytest.raises(RiskRejected): structural_plan(proposal(),quote(),rules(),cfg(**kwargs),900.,900.,atr=1.)
 
 @pytest.mark.parametrize('bad',[{'currency':'EUR'},{'multiplier':10},{'min_margin_pct':0},{'min_qty':1000}])
 def test_unknown_contract_and_invalid_quantity_rejected(bad):
-    with pytest.raises(RiskRejected): RiskEngine.plan(proposal(),quote(),rules(**bad),cfg(),900.,900.,atr=1.)
+    with pytest.raises(RiskRejected): structural_plan(proposal(),quote(),rules(**bad),cfg(),900.,900.,atr=1.)
 
 
 def test_leverage_capped_by_supplier_and_risk():
-    p=RiskEngine.plan(proposal(),quote(),rules(min_margin_pct=50),cfg(cfd_leverage=5),900.,900.,atr=1.)
+    p=structural_plan(proposal(),quote(),rules(min_margin_pct=50),cfg(cfd_leverage=5),900.,900.,atr=1.)
     assert p.leverage==2 and p.risk_usdt<=9.0000001
     assert p.margin==pytest.approx(p.entry*p.quantity*1.001/2)
 
 
 def test_short_permissions_and_market_closed():
-    with pytest.raises(RiskRejected): RiskEngine.plan(proposal(True),quote(),rules(allow_short=False),cfg(),900.,900.,atr=1.)
-    with pytest.raises(RiskRejected): RiskEngine.plan(proposal(True),quote(market_status='CLOSED'),rules(),cfg(),900.,900.,atr=1.)
+    with pytest.raises(RiskRejected): structural_plan(proposal(True),quote(),rules(allow_short=False),cfg(),900.,900.,atr=1.)
+    with pytest.raises(RiskRejected): structural_plan(proposal(True),quote(market_status='CLOSED'),rules(),cfg(),900.,900.,atr=1.)
 
 
 def test_huge_gap_may_exceed_collateral_and_is_not_clamped(book):
@@ -155,7 +156,7 @@ def test_migration_preserves_wallet_and_history(tmp_path):
     db=Store(path)
     assert db.get('cash')==777. and db.get('sentinel')=='original'
     assert {'kind','margin','direction'}<={r[1] for r in db.conn.execute('PRAGMA table_info(trades)')}
-    assert db.conn.execute('PRAGMA user_version').fetchone()[0]==2
+    assert db.conn.execute('PRAGMA user_version').fetchone()[0]==3
     db.close()
 
 
@@ -179,7 +180,7 @@ def cent_cfd_plan(reference=7.31,short=True,**changes):
     for key,value in changes.items():setattr(d,key,value)
     q=quote(reference,reference+.001) if short else quote(reference-.001,reference)
     c=cfg();r=rules(tick_size=.001)
-    return RiskEngine.plan(d,q,r,c,900.,900.,atr=.04),d,q,c
+    return structural_plan(d,q,r,c,900.,900.,atr=.04),d,q,c
 
 
 @pytest.mark.parametrize('short',[False,True])
@@ -207,7 +208,7 @@ def test_cfd_short_favorable_price_cannot_touch_or_cross_invalidation(offset):
     # structural invalidation invalidates the idea before the spread/slip fill.
     q=quote(7.304,7.305+offset)
     with pytest.raises(RiskRejected,match='Invalidation'):
-        RiskEngine.plan(d,q,rules(tick_size=.001),cfg(),900.,900.,atr=.04)
+        structural_plan(d,q,rules(tick_size=.001),cfg(),900.,900.,atr=.04)
 
 
 def test_cfd_zone_does_not_force_rr_after_financing_costs():

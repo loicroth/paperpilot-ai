@@ -7,7 +7,8 @@
   const num = (value, digits = 2) => n(value) === null ? '—' : new Intl.NumberFormat('fr-CH', {minimumFractionDigits: digits, maximumFractionDigits: digits}).format(n(value));
   const money = (value, unit = true) => `${num(value)}${unit && n(value) !== null ? ' USDT' : ''}`;
   const isCFD = (item) => item?.kind === 'cfd' || String(item?.symbol || '').startsWith('CAP:');
-  const priceText = (value, item) => `${num(value, isCFD(item) && n(value) !== null && n(value) < 10 ? 5 : 2)} ${item?.currency || (isCFD(item) ? 'USD' : 'USDT')}`;
+  const priceDigits = (value, item) => n(value) === null ? 2 : isCFD(item) ? (n(value)<10?5:2) : n(value)<0.01?8:n(value)<1?6:n(value)<100?4:2;
+  const priceText = (value, item) => `${num(value, priceDigits(value,item))} ${item?.currency || (isCFD(item) ? 'USD' : 'USDT')}`;
   const assetName = (value) => ({crypto:'Crypto Spot',shares:'Actions CFD',share:'Actions CFD',equity:'Actions CFD',stock:'Actions CFD',etf:'ETF CFD',indices:'Indices CFD',index:'Indices CFD',forex:'Devises CFD',currencies:'Devises CFD',currency:'Devises CFD',commodities:'Matières premières CFD',commodity:'Matières premières CFD'}[String(value || '').toLowerCase()] || value || 'CFD');
   const signed = (value) => n(value) === null ? '—' : `${n(value) > 0 ? '+' : ''}${num(value)}`;
   const time = (value, short = false) => {
@@ -91,16 +92,40 @@
     headings.forEach(x => tr.append(element('th','',x))); head.append(tr); table.append(head,body);
     rows.forEach(row => { const line = element('tr'); row.forEach(value => line.append(element('td','',value))); body.append(line); }); target.append(table);
   }
-  function renderPosition(position) {
-    const target = $('#positionContent'), panel = $('.position-panel'); target.replaceChildren(); panel.classList.toggle('has-position',Boolean(position)); set('#positionBadge',position ? `1 / 1 · ${isCFD(position) ? 'CFD' : 'SPOT'}` : '0 / 1');
-    if (!position) { target.className = 'empty-position'; target.append(element('div','position-glyph','◎'),element('strong','','Aucune position ouverte'),element('p','','Le robot peut attendre aussi longtemps que nécessaire pour trouver une configuration admissible.')); return; }
-    target.className = '';
-    const heading = element('div','position-symbol'); const profit = element('span','badge',`${signed(position.unrealized_pnl)} USDT`); pnlClass(profit,position.unrealized_pnl); heading.append(element('strong','',`${position.symbol}${isCFD(position) ? ' · '+(position.direction || 'LONG') : ''}`),profit); target.append(heading);
-    const grid = element('div','position-data');
-    const values = [['Prix d’entrée',priceText(position.entry,position)],['Prix actuel',priceText(position.current_price,position)],['Quantité',num(position.quantity,8)],['Stop-loss',priceText(position.stop_loss,position)],['Take-profit',priceText(position.take_profit,position)],['Ouverte le',time(position.opened_at)]];
-    if (isCFD(position)) values.push(['Sens',position.direction || 'LONG'],['Levier',`${num(position.leverage,1)}×`],['Marge immobilisée',money(position.margin)],['Financement simulé',money(position.financing_accrued)],['Durée maximale CFD','24 h puis première cotation négociable']);
-    values.forEach(([label,value]) => { const item = element('div'); item.append(element('small','',label),element('strong','',value)); grid.append(item); }); target.append(grid);
-    target.append(element('p','position-bottom',position.entry_reason || 'Protection virtuelle surveillée tant que les données sont disponibles.'));
+  function renderPositions(positions, settings, stats) {
+    const target=$('#positionContent'), panel=$('.position-panel'), limit=n(settings.max_positions) ?? 3;
+    target.replaceChildren(); panel.classList.toggle('has-position',positions.length>0);
+    set('#positionBadge',`${positions.length} / ${num(limit,0)}`);
+    const known=stats.portfolio_risk_known===true, used=known?n(stats.portfolio_risk_used):null, equity=n(stats.equity), capPct=n(settings.max_portfolio_risk_pct), cap=equity!==null && capPct!==null?Math.max(0,equity)*capPct/100:null;
+    const usedPct=known?n(stats.portfolio_risk_pct):null;
+    set('#portfolioRisk',known?`Risque restant estimé aux stops : ${money(used)} / ${money(cap)} · ${num(usedPct)} % / ${num(capPct)} % du capital`:`Risque restant aux stops indisponible : nouvelles entrées bloquées. Plafond : ${money(cap)} (${num(capPct)} % du capital).`);
+    $('#portfolioRisk').classList.toggle('risk-over-limit',used!==null && cap!==null && used>cap+1e-8);
+    if (!positions.length) {
+      target.className='empty-position';
+      target.append(element('div','position-glyph','◎'),element('strong','','Aucune position ouverte'),element('p','',`Jusqu’à ${num(limit,0)} positions peuvent être ouvertes si les limites de risque le permettent. Le robot peut attendre une configuration admissible.`));
+      return;
+    }
+    target.className='positions-list';
+    for (const position of positions) {
+      const cfd=isCFD(position), card=element('article',`open-position${cfd?' cfd-position':' spot-position'}`), heading=element('div','position-symbol');
+      const profit=element('span','badge',`${signed(position.unrealized_pnl)} USDT`);pnlClass(profit,position.unrealized_pnl);
+      heading.append(element('strong','',position.symbol),profit);card.append(heading);
+      card.append(element('p','position-kind',cfd?`CFD démo · ${position.direction || 'LONG'} · prix en ${position.currency || 'USD'}`:'Crypto Spot · LONG · prix en USDT'));
+      const grid=element('div','position-data');
+      const values=[['Prix d’entrée',priceText(position.entry,position)],['Prix actuel',priceText(position.current_price,position)],['Quantité',num(position.quantity,8)],['Stop-loss',priceText(position.stop_loss,position)],['Take-profit',priceText(position.take_profit,position)],['Risque initial estimé',money(position.risk_usdt)],['Ouverte le',time(position.opened_at)]];
+      const plan=position.detail?.plan, structure=plan?.structure_audit;
+      if(structure?.validated) values.push(['Repère du stop',`${priceText(structure.stop_reference?.price,position)} · ${structure.stop_reference?.timeframe || ''}`],['Prochain obstacle',`${priceText(structure.target_obstacle?.price,position)} · ${structure.target_obstacle?.timeframe || ''}`],['Ratio net prévu à l’entrée',`${num(plan.rr)} R`]);
+      if(cfd) values.push(['Levier',`${num(position.leverage,1)}×`],['Marge immobilisée',money(position.margin)],['Financement simulé',money(position.financing_accrued)],['Durée maximale CFD','24 h puis première cotation négociable']);
+      values.forEach(([label,value])=>{const item=element('div');item.append(element('small','',label),element('strong','',value));grid.append(item);});card.append(grid);
+      card.append(element('p','position-bottom',position.entry_reason || 'Protection virtuelle surveillée tant que les données sont disponibles.'));
+      card.append(detailButton(`Position ${position.symbol}`,`${cfd?'CFD démo':'Crypto Spot'} · ${position.direction || 'LONG'} · ${time(position.opened_at)}`,{
+        'Actif':position.symbol,'Type':cfd?'CFD démo':'Crypto Spot','Sens':position.direction || 'LONG',
+        'Ouverture':time(position.opened_at),'Prix d’entrée':priceText(position.entry,position),'Prix actuel':priceText(position.current_price,position),
+        'Quantité':num(position.quantity,8),'Stop-loss':priceText(position.stop_loss,position),'Take-profit':priceText(position.take_profit,position),
+        'Résultat latent':`${signed(position.unrealized_pnl)} USDT`,'Risque initial estimé':money(position.risk_usdt),'Motif d’entrée':position.entry_reason || '—'
+      }));
+      target.append(card);
+    }
   }
   function renderMarkets(quotes) {
     const container = $('#markets'); container.replaceChildren();
@@ -203,7 +228,7 @@
     $('#startButton').disabled=control.mode==='running'; $('#pauseButton').disabled=control.mode==='paused' || control.mode==='stopped'; $('#stopButton').disabled=control.mode==='stopped';
     renderProviders(data.providers, data.settings?.cfd_enabled === true);
     renderScanner(data.scanner,data.settings?.auto_scanner || data.settings?.cfd_enabled);
-    renderStats(stats);renderPosition(data.position);renderMarkets(array(data.quotes));renderDecision(array(data.decisions));renderTables(array(data.trades),array(data.decisions));renderEvents(array(data.events));renderSettings(data.settings || {},data.usage || {});renderChart(array(data.equity));
+    renderStats(stats);renderPositions(Array.isArray(data.positions)?data.positions:Array.isArray(stats.positions)?stats.positions:data.position?[data.position]:[],data.settings || {},stats);renderMarkets(array(data.quotes));renderDecision(array(data.decisions));renderTables(array(data.trades),array(data.decisions));renderEvents(array(data.events));renderSettings(data.settings || {},data.usage || {});renderChart(array(data.equity));
   }
   async function refresh() {
     if(inFlight)return;inFlight=true;
@@ -221,7 +246,7 @@
   $('#settingsForm').addEventListener('input',()=>{dirtySettings=true;set('#settingsSaved','Modifications non enregistrées');});
   $('#settingsForm').addEventListener('submit',async(event)=>{
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
-    const body={};for(const key of ['risk_pct','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
+    const body={};for(const key of ['risk_pct','max_trade_risk_pct','max_portfolio_risk_pct','max_positions','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
     body.auto_scanner=form.elements.auto_scanner.value==='true';
     body.cfd_enabled=form.elements.cfd_enabled.value==='true';
     body.allow_short=form.elements.allow_short.value==='true';

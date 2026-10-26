@@ -1,6 +1,8 @@
 """Contract-shaped fixtures, not real broker sessions, trades or profitability."""
+import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 import httpx
 import pytest
 from app.capital import CapitalClient, DEMO_BASE
@@ -31,6 +33,7 @@ def rig(monkeypatch):
     captured=[]; state={'details':details(),'rows':[market()],'auths':0,'fail_auth':False,'fail_once':False}
     async def no_sleep(_):pass
     monkeypatch.setattr('app.capital.asyncio.sleep',no_sleep)
+    monkeypatch.setattr('app.capital.time.time',lambda:NOW/1000)
     async def handler(request):
         captured.append(request)
         assert str(request.url).startswith(DEMO_BASE+'/')
@@ -71,7 +74,7 @@ async def test_no_credentials_blocks_login_without_request():
 
 
 @pytest.mark.asyncio
-async def test_quote_uses_exchange_utc_timestamp_and_usd(rig):
+async def test_quote_preserves_exchange_event_age_on_local_clock_and_usd(rig):
     c,state,requests,client=rig
     q=await c.quote('CAP:SILVER')
     assert q.time_ms==NOW and q.bid==24 and q.ask==24.02 and q.currency=='USD'
@@ -165,3 +168,85 @@ async def test_no_utc_time_no_freshness_substitution(rig):
     state['rows']=[market(updateTimeUTC=None,updateTime=TIME)]
     with pytest.raises(MarketError):await c.quote('CAP:SILVER')
     await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('broker_offset',[30000,-30000])
+async def test_quote_normalizes_clock_offset_without_erasing_event_age(rig,monkeypatch,broker_offset):
+    from app.capital import _timestamp
+    c,state,_,client=rig
+    broker_now=NOW+broker_offset
+    event_at=broker_now-10000
+    state['rows']=[market(updateTimeUTC=datetime.fromtimestamp(event_at/1000,timezone.utc).isoformat())]
+    async def clock():return broker_now
+    monkeypatch.setattr(c,'server_time',clock)
+    quote=await c.quote('CAP:SILVER')
+    assert quote.time_ms==NOW-10000
+    assert NOW-quote.time_ms==broker_now-_timestamp(state['rows'][0]['updateTimeUTC'])
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slight_broker_future_tolerance_never_produces_local_future_quote(rig,monkeypatch):
+    c,state,_,client=rig
+    state['rows']=[market(updateTimeUTC=datetime.fromtimestamp((NOW+800)/1000,timezone.utc).isoformat())]
+    async def clock():return NOW
+    monkeypatch.setattr(c,'server_time',clock)
+    assert (await c.quote('CAP:SILVER')).time_ms==NOW
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_metadata_lookup_cannot_refresh_quote_that_became_stale(rig,monkeypatch):
+    c,state,_,client=rig
+    clock={'now':NOW}
+    state['rows']=[market(updateTimeUTC=datetime.fromtimestamp((NOW-10000)/1000,timezone.utc).isoformat())]
+    async def server_time():return clock['now']
+    async def delayed_details(symbol):
+        clock['now']+=6000
+        return details()
+    monkeypatch.setattr(c,'server_time',server_time)
+    monkeypatch.setattr(c,'_detail',delayed_details)
+    with pytest.raises(MarketError,match='trop ancienne'):await c.quote('CAP:SILVER')
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slow_metadata_does_not_block_quote_and_request_starts_stay_paced(monkeypatch):
+    clock={'now':100.}
+    starts=[];delays=[]
+    metadata_started=asyncio.Event();release_metadata=asyncio.Event()
+    async def paced_sleep(delay):
+        delays.append(delay)
+        clock['now']+=delay
+        await asyncio.sleep(0)
+    # Keep the event loop's real clock intact while advancing provider pacing.
+    monkeypatch.setattr('app.capital.time',SimpleNamespace(
+        monotonic=lambda:clock['now'],time=lambda:NOW/1000))
+    monkeypatch.setattr('app.capital.asyncio',SimpleNamespace(Lock=asyncio.Lock,sleep=paced_sleep))
+    async def handler(request):
+        starts.append((request.url.path,clock['now']))
+        if request.url.path.endswith('/markets/NVDA'):
+            metadata_started.set()
+            await release_metadata.wait()
+            body=details();body['instrument']['epic']='NVDA'
+        else:
+            assert request.url.path.endswith('/markets')
+            assert request.url.params['epics']=='SILVER'
+            body={'markets':[market()]}
+        return httpx.Response(200,json=body,headers={'Date':DATE})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        c=CapitalClient('fixture-key','fixture-user','fixture-password',client=client)
+        c._tokens={'CST':'fixture-cst','X-SECURITY-TOKEN':'fixture-security'}
+        c._details['CAP:SILVER']=details();c._details_at['CAP:SILVER']=clock['now']
+        metadata_task=asyncio.create_task(c.rules(['CAP:NVDA']))
+        try:
+            await asyncio.wait_for(metadata_started.wait(),timeout=.5)
+            quote=await asyncio.wait_for(c.quote('CAP:SILVER'),timeout=.5)
+            assert quote.symbol=='CAP:SILVER' and quote.bid==24.
+            assert not metadata_task.done() and not release_metadata.is_set()
+            assert len(starts)==2 and starts[1][1]-starts[0][1]>=.26-1e-12
+            assert delays==pytest.approx([.26])
+        finally:
+            release_metadata.set()
+            await metadata_task

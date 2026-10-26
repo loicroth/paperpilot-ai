@@ -1,4 +1,8 @@
-# Extension multi-marchés (24 octobre 2026)
+# Niveaux de marché et portefeuille multi-positions (26 octobre 2026)
+
+Les nouvelles entrées utilisent des stops justifiés par les pivots/supports/résistances M5/H1 et des objectifs avant le premier obstacle connu. Aucun objectif n'est construit pour fabriquer 2R : si les niveaux observés ne permettent pas le ratio net, l'entrée est refusée. Trois positions simultanées par défaut, risque habituel 1 %, maximum 1,4 % par trade et 2 % de risque cumulé aux stops. Les quantités diminuent lorsque le stop est plus éloigné. Le capital ou la marge par position est limité à une part du portefeuille (`equity / max_positions`) pour laisser des liquidités aux autres signaux. [Détails et limites](docs/STRUCTURE_PORTFOLIO.md).
+
+# Extension multi-marchés
 
 La version déployée conserve le portefeuille900USDT et son historique. Elle ajoute la simulation CFD LONG/SHORT (actions sous-jacentes,ETF,indices,forex,matières premières) avec levier plafonné, marge et financement estimé. Les actions détenues directement et les futures de bourse ne sont pas pris en charge.
 
@@ -23,7 +27,7 @@ Gardez l'ordinateur allumé, connecté à Internet et le programme ouvert. Une m
 
 ## Première session avec 900 USDT virtuels
 
-- Gardez les paramètres initiaux : BTC/USDT, ETH/USDT, SOL/USDT ; risque maximal 1 % par trade ; une seule position ; perte journalière maximale 2 % ; ratio net estimé minimal 2:1.
+- Gardez les paramètres initiaux : BTC/USDT, ETH/USDT, SOL/USDT ; risque habituel 1 %, maximum 1,4 % par trade ; trois positions au maximum, avec 2 % de risque cumulé ; perte journalière maximale 2 % ; ratio net estimé minimal 2:1.
 - Cliquez sur **Démarrer la simulation** et attendez une **nouvelle clôture M5**. Les bougies historiques initialisent les indicateurs ; elles ne génèrent aucun trade rétroactif.
 - Vérifiez l'heure de la dernière cotation, les spreads et la dernière analyse. Ouvrez une décision pour lire les indicateurs, l'explication IA et le motif d'un éventuel refus.
 - **WAIT/ATTENDRE est normal.** Le robot peut rester plusieurs heures sans acheter. Un appel IA refusé ou des données trop anciennes bloque les entrées.
@@ -45,11 +49,11 @@ Un stop virtuel n'est jamais un ordre hébergé chez Binance. Une panne, une abs
 
 ## Paramètres
 
-Le modèle défini dans `.env` initialise une nouvelle base ; ensuite le choix enregistré dans le tableau de bord prévaut. Les paramètres de risque, marchés et modèle se modifient dans le tableau de bord et sont conservés dans SQLite. Les plafonds de sécurité ne peuvent pas être dépassés : risque par trade 1 %, perte quotidienne 2 %, ratio minimal 2. Les frais supposés sont **0,1 % à l'achat et à la vente**, avec **5 points de base de glissement défavorable** et le spread bid/ask observé. Ajustez les frais si nécessaire : ils sont une hypothèse de simulation, pas la tarification de votre compte.
+Le modèle défini dans `.env` initialise une nouvelle base ; ensuite le choix enregistré dans le tableau de bord prévaut. Les paramètres de risque, marchés et modèle se modifient dans le tableau de bord et sont conservés dans SQLite. Les plafonds de sécurité ne peuvent pas être dépassés : risque par trade 1,4 %, six positions maximum (trois par défaut), risque cumulé maximal réglable à 4 % (2 % par défaut), perte quotidienne 2 %, ratio net minimal 2. Les frais supposés sont **0,1 % à l'achat et à la vente**, avec **5 points de base de glissement défavorable** et le spread bid/ask observé. Ajustez les frais si nécessaire : ils sont une hypothèse de simulation, pas la tarification de votre compte.
 
-La taille d’une entrée est également réduite au risque journalier estimé restant. Une erreur critique interrompt les analyses jusqu’à un nouveau clic sur Démarrer. Le budget initial autorise au maximum **288 appels OpenAI et 2 000 000 tokens par jour UTC**, avec un maximum de **1 800 tokens de sortie par appel**. Le moteur réserve le budget avant un appel, y compris en cas d'erreur. Il regroupe les marchés dans un seul appel par clôture M5. Ce plafond de consommation n'est pas un plafond en dollars ; configurez également les limites et alertes du projet OpenAI. Le modèle est configurable ; une incompatibilité avec Structured Outputs bloque l'analyse et apparaît dans le tableau de bord.
+La taille d’une entrée est également réduite au risque journalier estimé restant, après déduction du risque des positions ouvertes. Une erreur critique interrompt les analyses jusqu’à un nouveau clic sur Démarrer. Le budget initial autorise au maximum **288 appels OpenAI et 2 000 000 tokens par jour UTC**, avec un maximum de **1 800 tokens de sortie par appel**. Le moteur réserve le budget avant un appel, y compris en cas d'erreur. Il compare les candidats dans un appel d’entrée et peut gérer une position en rotation dans un appel distinct ; les deux partagent ces mêmes plafonds. La gestion réserve le budget en premier et les SL/TP restent surveillés sans IA. Ce plafond de consommation n'est pas un plafond en dollars ; configurez également les limites et alertes du projet OpenAI. Le modèle est configurable ; une incompatibilité avec Structured Outputs bloque l'analyse et apparaît dans le tableau de bord.
 
-Les cotations REST `bookTicker` ne portent pas d’horodatage d’événement : l’heure affichée correspond à leur réception, ajustée à l’heure Binance.
+Les cotations REST `bookTicker` ne portent pas d’horodatage d’événement : l’heure affichée correspond à leur réception selon l'horloge locale. L'heure Binance détermine les clôtures des bougies.
 
 Les marchés ajoutés doivent être des paires Spot cotées en USDT disponibles chez Binance. Les filtres de quantité et de montant sont téléchargés depuis `exchangeInfo` et vérifiés avant chaque achat virtuel. Le contrôle notionnel paper utilise le prix simulé ; Binance peut utiliser un prix moyen et d’autres contrôles pour les ordres réels. Le portefeuille ne fait ni vente à découvert, ni levier, ni renforcement d'une position.
 

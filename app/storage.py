@@ -28,7 +28,6 @@ class Store:
           exit_reason TEXT, detail TEXT NOT NULL, last_market_at INTEGER NOT NULL,
           entry_bid REAL NOT NULL, entry_ask REAL NOT NULL, exit_bid REAL, exit_ask REAL,
           signal TEXT UNIQUE NOT NULL, fee_rate REAL NOT NULL, slippage_bps REAL NOT NULL);
-        CREATE UNIQUE INDEX IF NOT EXISTS one_position ON trades((1)) WHERE closed_at IS NULL;
         CREATE TABLE IF NOT EXISTS signals(id TEXT PRIMARY KEY, at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, at TEXT NOT NULL, symbol TEXT NOT NULL,
           action TEXT NOT NULL, reason TEXT NOT NULL, rejection TEXT, detail TEXT NOT NULL);
@@ -38,9 +37,10 @@ class Store:
         CREATE TABLE IF NOT EXISTS usage(day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0,
           tokens INTEGER NOT NULL DEFAULT 0);
         ''')
-        if had_file and self.conn.execute('PRAGMA user_version').fetchone()[0]<2:
+        previous_version=self.conn.execute('PRAGMA user_version').fetchone()[0]
+        if had_file and previous_version<3:
             backups=Path(path).parent/'backups';backups.mkdir(exist_ok=True)
-            name='avant_multimarche_'+__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y%m%d_%H%M%S_%f')+'.sqlite3'
+            name='avant_multi_positions_'+__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y%m%d_%H%M%S_%f')+'.sqlite3'
             with sqlite3.connect(str(backups/name)) as backup: self.conn.backup(backup)
         # Additive, idempotent migration: existing spot positions/history retain defaults.
         columns={row[1] for row in self.conn.execute('PRAGMA table_info(trades)')}
@@ -55,11 +55,13 @@ class Store:
         with self.transaction():
             for name, declaration in additions.items():
                 if name not in columns: self.conn.execute(f'ALTER TABLE trades ADD COLUMN {name} {declaration}')
+            self.conn.execute('DROP INDEX IF EXISTS one_position')
+            self.conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS one_position_per_symbol ON trades(symbol) WHERE closed_at IS NULL')
             if self.get('cash') is None:
                 self.set('cash',900.0); self.set('initial_capital',900.0)
                 self.set('settings',Settings().model_dump()); self.set('mode','stopped')
                 self.set('session_started',utcnow())
-            self.conn.execute("PRAGMA user_version=2")
+            if previous_version<3: self.conn.execute("PRAGMA user_version=3")
     @contextmanager
     def transaction(self):
         with self.lock:
@@ -77,8 +79,13 @@ class Store:
         with self.lock: self.conn.execute('INSERT INTO kv VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,dumps(value)))
     def rows(self,sql,args=()):
         with self.lock: return [dict(r) for r in self.conn.execute(sql,args).fetchall()]
-    def position(self):
-        rows=self.rows('SELECT * FROM trades WHERE closed_at IS NULL')
+    def positions(self):
+        return [self.decode_trade(row) for row in self.rows('SELECT * FROM trades WHERE closed_at IS NULL ORDER BY id')]
+    def position(self,symbol=None):
+        if symbol is None:
+            rows=self.rows('SELECT * FROM trades WHERE closed_at IS NULL ORDER BY id LIMIT 1')
+        else:
+            rows=self.rows('SELECT * FROM trades WHERE closed_at IS NULL AND symbol=? ORDER BY id LIMIT 1',(symbol,))
         return self.decode_trade(rows[0]) if rows else None
     @staticmethod
     def decode_trade(row):
@@ -108,10 +115,11 @@ class Store:
             if actual>0: self.conn.execute('UPDATE usage SET tokens=MAX(0,tokens+?) WHERE day=?',(actual-reserve,day))
     def reset(self, force=False):
         with self.transaction():
-            if self.position() and not force: raise ValueError('Fermez la position avant de réinitialiser le portefeuille.')
+            if self.position() and not force: raise ValueError('Fermez toutes les positions avant de réinitialiser le portefeuille.')
             self.set('mode','stopped')
             for table in ('trades','signals','decisions','equity','events'): self.conn.execute('DELETE FROM '+table)
-            for key in ('day_state','btc_baseline','last_equity','last_analysis_at','last_cycle','market_ready_after','reconcile_pending'):
+            for key in ('day_state','btc_baseline','last_equity','last_analysis_at','last_cycle','market_ready_after',
+                        'reconcile_pending','reconcile_pending_by_id','last_managed_position_id'):
                 self.conn.execute('DELETE FROM kv WHERE key=?',(key,))
             self.set('cash',900.0); self.set('initial_capital',900.0); self.set('session_started',utcnow())
             self.event('Portefeuille réinitialisé à 900 USDT. Le budget API du jour est conservé.')

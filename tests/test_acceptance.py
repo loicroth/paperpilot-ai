@@ -12,6 +12,7 @@ from app.market import Quote, Rules
 from app.metrics import statistics
 from app.risk import RiskEngine
 from app.storage import Store
+from test_structural_risk import structural_plan
 
 
 def fixture_quote(symbol='BTCUSDT',bid=100.0):
@@ -26,7 +27,7 @@ def fixture_buy(db,signal='acceptance-m5-1',symbol='BTCUSDT'):
     cfg=Settings.model_validate(db.get('settings'))
     rule=Rules(symbol,.001,100000.0,.001,5.0,1000000.0,.01)
     cash=db.get('cash')
-    plan=RiskEngine.plan(d,q,rule,cfg,cash,cash,atr=.8)
+    plan=structural_plan(d,q,rule,cfg,cash,cash,atr=.8)
     p=PaperExecutionEngine(db).buy(plan,q,signal,d,cfg,{'fixture':True})
     return p
 

@@ -18,7 +18,10 @@ class Settings(BaseModel):
     allow_short: bool = True
     cfd_financing_daily: float = Field(default=0.001, ge=0.0001, le=0.01)
     cfd_scan_limit: int = Field(default=20, ge=3, le=40)
-    risk_pct: float = Field(default=1.0, gt=0, le=1)
+    max_positions: int = Field(default=3, ge=1, le=6)
+    max_trade_risk_pct: float = Field(default=1.4, gt=0, le=1.4)
+    max_portfolio_risk_pct: float = Field(default=2.0, gt=0, le=4.0)
+    risk_pct: float = Field(default=1.0, gt=0, le=1.4)
     daily_loss_pct: float = Field(default=2.0, gt=0, le=2)
     min_rr: float = Field(default=2.0, ge=2, le=20)
     fee_rate: float = Field(default=.001, ge=.0001, le=.01)

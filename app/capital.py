@@ -94,8 +94,10 @@ class CapitalClient:
             async with self._request_lock:
                 delay=.26-(time.monotonic()-self._last_request)
                 if delay>0: await asyncio.sleep(delay)
+                if time.monotonic()<self._blocked_until:
+                    raise MarketError('Capital démo impose une pause ; nouvelle requête différée.')
                 self._last_request=time.monotonic()
-                response=await self.client.request(method,DEMO_BASE+path,params=params,json=body,headers=headers)
+            response=await self.client.request(method,DEMO_BASE+path,params=params,json=body,headers=headers)
             self._record_clock(response)
             if response.status_code==429:
                 try: pause=max(1,min(3600,float(response.headers.get('Retry-After','60'))))
@@ -218,13 +220,20 @@ class CapitalClient:
             if row.get('marketStatus')!='TRADEABLE':raise MarketError('Marché CFD fermé ou suspendu.')
             if row.get('delayTime')!=0:raise MarketError('Cotation CFD retardée ou délai non précisé.')
             stamp=_timestamp(row.get('updateTimeUTC'))
-            now=await self.server_time()
-            if not -1000<=now-stamp<=15000:raise MarketError('Cotation CFD trop ancienne ou datée dans le futur.')
+            broker_now=await self.server_time()
+            if not -1000<=broker_now-stamp<=15000:raise MarketError('Cotation CFD trop ancienne ou datée dans le futur.')
             bid,ask=_positive(row['bid']),_positive(row['offer'])
             if ask<bid or ask/bid>1.05:raise ValueError()
             detail=await self._detail(symbol)
             if detail['instrument'].get('currency')!='USD':raise MarketError('Conversion de cette devise CFD non prise en charge.')
-            return Quote(symbol,bid,ask,stamp,currency='USD',market_status='TRADEABLE')
+            # Preserve the observed event age across clock domains. A broker
+            # clock offset must not make a valid quote appear future/stale to
+            # local execution, and metadata latency must not refresh old data.
+            broker_now=await self.server_time()
+            event_age=broker_now-stamp
+            if not -1000<=event_age<=15000:raise MarketError('Cotation CFD trop ancienne ou datée dans le futur.')
+            local_stamp=int(time.time()*1000)-max(event_age,0)
+            return Quote(symbol,bid,ask,local_stamp,currency='USD',market_status='TRADEABLE')
         except (KeyError,TypeError,ValueError,OverflowError):
             raise MarketError('Cotation CFD incomplète ; aucun prix de remplacement.') from None
 

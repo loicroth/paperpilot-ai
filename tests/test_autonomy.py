@@ -47,7 +47,7 @@ async def test_slow_symbol_does_not_block_ready_candidates(rig,monkeypatch):
     monkeypatch.setattr(market,'liquid_symbols',symbols,raising=False)
     monkeypatch.setattr(market,'quote',quote)
     monkeypatch.setattr('app.engine.asyncio.wait',bounded)
-    monkeypatch.setattr('app.engine.candidates',lambda a,b:['breakout'])
+    monkeypatch.setattr('app.engine.candidates',lambda a,b,**kw:['breakout'])
     await bot._analyze()
     assert db.position()['symbol']=='BTCUSDT'
     assert next(r for r in bot.scan['rows'] if r['symbol']=='XRPUSDT')['status']=='INDISPONIBLE'

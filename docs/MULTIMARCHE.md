@@ -2,7 +2,7 @@
 
 ## Fonctionnement livré
 
-Un seul portefeuille virtuel initial de 900 USDT, une seule position globale : Binance Spot ou CFD Capital.com démo. Le capital existant n'est pas réinitialisé. Le mode réel reste inaccessible et aucun point d'accès d'ordre de courtier n'existe dans le code. Le client Capital a une liste fermée de requêtes GET de données et de POST de session sur le seul serveur DEMO.
+Un seul portefeuille virtuel initial de 900 USDT, plusieurs positions Binance Spot et/ou CFD Capital.com démo (trois par défaut, six maximum, une par symbole). Le capital existant n'est pas réinitialisé. Le mode réel reste inaccessible et aucun point d'accès d'ordre de courtier n'existe dans le code. Le client Capital a une liste fermée de requêtes GET de données et de POST de session sur le seul serveur DEMO.
 
 Scanner crypto existant (30 marchés par défaut, 40 maximum) + scanner CFD optionnel (20 par défaut, 40 maximum). Catalogue CFD équilibré entre actions sous-jacentes, ETF, indices, devises et matières premières. Seulement contrats sans échéance, cotés USD, multiplicateur unitaire, tailles/précisions/marges vérifiables. Les autres contrats, marchés fermés ou cotations retardées sont explicitement exclus. Les marchés dépendent du catalogue réellement accessible au compte. Ce ne sont pas des actions détenues en direct ni des futures de bourse.
 
@@ -10,7 +10,7 @@ Chaque clôture M5 est comparée à H1. Achats LONG ou SHORT autorisés seulemen
 
 ## Marge, risques et coûts virtuels
 
-Risque maximal prévu 1 % du portefeuille, perte journalière 2 %, ratio net minimal 2R, aucune moyenne à la baisse. Levier CFD simulé 2 par défaut, configurable de 1 à 5, plafonné aussi par les exigences du contrat. La marge immobilise des liquidités ; aucun produit de vente fictif n'est crédité pour un short. Les déficits après gap restent visibles, sans mise à zéro artificielle.
+Risque habituel prévu 1 %, maximum 1,4 % par trade et 2 % cumulé par défaut, perte journalière 2 %, ratio net minimal 2R, aucune moyenne à la baisse. Voir STRUCTURE_PORTFOLIO.md pour les niveaux et allocations. Levier CFD simulé 2 par défaut, configurable de 1 à 5, plafonné aussi par les exigences du contrat. La marge immobilise des liquidités ; aucun produit de vente fictif n'est crédité pour un short. Les déficits après gap restent visibles, sans mise à zéro artificielle.
 
 Bid/ask démo Capital, glissement défavorable, commissions configurées et financement estimé. Le financement initial 0,10 % du notionnel par jour est une hypothèse conservatrice de simulation, pas le tarif exact du courtier. Le calcul de risque réserve un jour de financement ; sortie prévue au premier cours négociable frais après 24 h. Une fermeture de marché ou une panne peut retarder cette sortie et accroître le coût. Un stop ne garantit jamais la perte maximale en cas de gap.
 
@@ -26,7 +26,7 @@ Activer ensuite « Scanner CFD », enregistrer puis Démarrer. La connexion n'ac
 
 ## Reprise et persistance
 
-Migration SQLite v2 additive et transactionnelle, sauvegarde automatique avant migration d'une ancienne base dans DATA_DIR/backups. Données, solde, paramètres et positions conservés. Le serveur conserve désormais le mode demandé (marche, pause ou arrêt) après redémarrage ; voir AUTONOMIE.md pour les vérifications et le démarrage ponctuel. Les protections surveillent toute position existante dès que des cotations fraîches reviennent. Après une interruption, M1 est réconcilié prudemment (enveloppe bid/ask, priorité stop). Une fenêtre incomplète bloque les prises de profit favorables supposées ; les stops courants, appels de marge et limite de durée restent surveillés. Les périodes de fermeture peuvent empêcher une reconstitution complète. Ne pas revenir à l'ancienne version Spot avec une position CFD ouverte.
+Migration SQLite v3 additive et transactionnelle, sauvegarde automatique avant migration d'une ancienne base dans DATA_DIR/backups. Données, solde, paramètres et positions conservés. Le serveur conserve désormais le mode demandé (marche, pause ou arrêt) après redémarrage ; voir AUTONOMIE.md pour les vérifications et le démarrage ponctuel. Les protections surveillent toute position existante dès que des cotations fraîches reviennent. Après une interruption, M1 est réconcilié prudemment (enveloppe bid/ask, priorité stop). Une fenêtre incomplète bloque les prises de profit favorables supposées ; les stops courants, appels de marge et limite de durée restent surveillés. Les périodes de fermeture peuvent empêcher une reconstitution complète. Ne pas revenir à l'ancienne version Spot avec une position CFD ouverte.
 
 ## Vérifications réellement réalisées
 

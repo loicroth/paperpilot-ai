@@ -10,7 +10,9 @@ from app.ai import Decision
 from app.config import Settings
 from app.execution import LiveExecutionEngine, PaperExecutionEngine
 from app.market import Candle, Quote, Rules
-from app.risk import RiskEngine, RiskRejected, floor_step
+from app.risk import RiskEngine, RiskRejected
+from test_structural_risk import structural_plan
+from app.risk import floor_step
 from app.storage import Store
 
 
@@ -44,7 +46,7 @@ def make_plan(settings, rules, **overrides):
     args=dict(decision=decision(), quote=quote(), rules=rules, settings=settings,
               cash=900.0,equity=900.0,atr=.8)
     args.update(overrides)
-    return RiskEngine.plan(**args)
+    return structural_plan(**args)
 
 
 def open_position(store,settings,rules,signal='fixture-m5-1'):
@@ -258,7 +260,7 @@ def test_live_execution_cannot_be_instantiated():
 def test_reset_preserves_api_budget_and_refuses_open_holdings(store,settings,rules):
     assert store.reserve_usage('2026-10-23',288,10000,500)
     open_position(store,settings,rules)
-    with pytest.raises(ValueError,match='Fermez la position'):
+    with pytest.raises(ValueError,match='Fermez toutes les positions'):
         store.reset()
     PaperExecutionEngine(store).sell(quote(101,101.01),'Fixture close')
     store.reset()
@@ -278,11 +280,10 @@ def test_budget_reservation_blocks_overrun_and_uncertain_timeout_keeps_reservati
     assert not store.reserve_usage('2026-10-24',2,100,400)
 
 
-def test_protection_rejects_wrong_symbol_without_advancing_last_market_at(store,settings,rules):
+def test_protection_ignores_unheld_symbol_without_advancing_last_market_at(store,settings,rules):
     _,p=open_position(store,settings,rules)
     before=p['last_market_at']
-    with pytest.raises(ValueError):
-        PaperExecutionEngine(store).protect(quote(100,100.01,symbol='ETHUSDT'))
+    assert PaperExecutionEngine(store).protect(quote(100,100.01,symbol='ETHUSDT')) is None
     assert store.position()['last_market_at']==before
 
 
@@ -310,7 +311,7 @@ def entry_zone_decision(**updates):
 
 def entry_zone_plan(ask,settings=None,decision_override=None,atr=.04):
     settings=settings or Settings()
-    return RiskEngine.plan(decision_override or entry_zone_decision(),quote(bid=ask-.001,ask=ask),
+    return structural_plan(decision_override or entry_zone_decision(),quote(bid=ask-.001,ask=ask),
         Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),settings,900.,900.,atr=atr)
 
 
@@ -323,7 +324,8 @@ def test_entry_zone_one_cent_adverse_move_resizes_actual_fill_without_moving_exi
     assert plan.rr>=2 and plan.risk_usdt<=9.+1e-10
     assert plan.quantity<initial.quantity
     loss=plan.entry*(1+cfg.fee_rate)-plan.stop_loss*(1-cfg.slippage_bps/10000)*(1-cfg.fee_rate)
-    assert plan.quantity==floor_step(9./loss,.001)
+    allocation=900./cfg.max_positions
+    assert plan.quantity==floor_step(min(9./loss,allocation/(plan.entry*(1+cfg.fee_rate))),.001)
     assert plan.entry_fee==pytest.approx(plan.entry*plan.quantity*cfg.fee_rate)
 
 
@@ -358,12 +360,12 @@ def test_entry_zone_invalidation_touch_and_cross_are_strict(bid_offset):
     d=entry_zone_decision(stop_loss=7.28,take_profit=7.45,invalidation=7.295)
     q=quote(bid=7.295+bid_offset,ask=7.296)
     with pytest.raises(RiskRejected,match='Invalidation'):
-        RiskEngine.plan(d,q,Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),Settings(),900.,900.,atr=.04)
+        structural_plan(d,q,Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),Settings(),900.,900.,atr=.04)
 
 
 def test_entry_zone_does_not_override_spread_guard():
     with pytest.raises(RiskRejected,match='Spread'):
-        RiskEngine.plan(entry_zone_decision(),quote(bid=7.28,ask=7.31),
+        structural_plan(entry_zone_decision(),quote(bid=7.28,ask=7.31),
             Rules('BTCUSDT',.001,100000.,.001,5.,1e6,.001),Settings(),900.,900.,atr=.04)
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
-import json, math, time
+import json, math, time, logging
 from .storage import utcnow, dumps
 from .risk import cfd_fx
+
+log=logging.getLogger('paperpilot')
 
 class LiveExecutionEngine:
     """Intentionally unavailable: no signed request or API order endpoint exists in V1."""
@@ -10,41 +12,62 @@ class LiveExecutionEngine:
 
 class PaperExecutionEngine:
     def __init__(self,store): self.store=store
+    @staticmethod
+    def _trade_audit(event,p,plan=None):
+        """Private structured audit, deliberately excluding balances and credentials."""
+        try:
+            detail=p.get('detail') or {}; stored_plan=detail.get('plan') or {}
+            structure=getattr(plan,'structure_audit',None) if plan is not None else stored_plan.get('structure_audit')
+            data={'event':event,'at':utcnow(),'symbol':p['symbol'],'trade_id':p['id'],
+                'kind':p.get('kind','spot'),'direction':p.get('direction','LONG'),
+                'entry':p['entry'],'stop_loss':p['stop_loss'],'take_profit':p['take_profit'],
+                'quantity':p['quantity'],'risk_usdt':p['risk_usdt'],
+                'rr':getattr(plan,'rr',None) if plan is not None else stored_plan.get('rr'),
+                'risk_pct_used':getattr(plan,'risk_pct_used',None) if plan is not None else stored_plan.get('risk_pct_used'),
+                'exit':p.get('exit'),'net_pnl':p.get('net_pnl'),
+                'reason':p.get('exit_reason') if event=='CLOSE' else p.get('entry_reason'),
+                'structure_audit':structure}
+            log.info('PAPER_TRADE_AUDIT %s',json.dumps(data,ensure_ascii=False,allow_nan=False))
+        except (KeyError,TypeError,ValueError,AttributeError):
+            log.warning('PAPER_TRADE_AUDIT unavailable for a recorded trade')
     def buy(self,plan,quote,signal,decision,settings,detail):
         if getattr(plan,'kind','spot')=='cfd':
             return self._cfd_open(plan,quote,signal,decision,settings,detail)
+        if quote.symbol!=plan.symbol: raise ValueError('Marché de cotation différent du plan.')
         now=int(time.time()*1000)
         if not 0<=now-quote.time_ms<=15000: raise ValueError('Achat bloqué : cotation périmée.')
         with self.store.transaction():
-            if self.store.position(): raise ValueError('Une position est déjà ouverte.')
+            if self.store.position(plan.symbol): raise ValueError('Une position est déjà ouverte sur ce marché.')
             if self.store.rows('SELECT id FROM trades WHERE signal=?',(signal,)): raise ValueError('Signal déjà exécuté.')
             cost=plan.entry*plan.quantity+plan.entry_fee
             cash=self.store.get('cash')
             if cost>cash+1e-8: raise ValueError('Capital insuffisant.')
             self.store.conn.execute('''INSERT INTO trades(symbol,opened_at,entry,quantity,stop_loss,take_profit,
-                entry_fee,fees,risk_usdt,entry_reason,detail,last_market_at,entry_bid,entry_ask,signal,fee_rate,slippage_bps)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                entry_fee,fees,risk_usdt,entry_reason,detail,last_market_at,entry_bid,entry_ask,signal,fee_rate,slippage_bps,last_bid,last_ask)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (plan.symbol,utcnow(),plan.entry,plan.quantity,plan.stop_loss,plan.take_profit,plan.entry_fee,
                  plan.entry_fee,plan.risk_usdt,decision.reason,dumps(detail),quote.time_ms,quote.bid,quote.ask,
-                 signal,settings.fee_rate,settings.slippage_bps))
+                 signal,settings.fee_rate,settings.slippage_bps,quote.bid,quote.ask))
             self.store.set('cash',max(0,cash-cost))
             self.store.event(f'ACHAT PAPER {plan.symbol} : {plan.quantity:g} à {plan.entry:.6g} USDT. Risque estimé {plan.risk_usdt:.2f} USDT.')
-        return self.store.position()
+            opened=self.store.position(plan.symbol)
+        self._trade_audit('OPEN',opened,plan)
+        return opened
     def validate_quote(self,quote):
-        p=self.store.position()
+        p=self.store.position(quote.symbol)
         if not p: raise ValueError('Aucune position détenue : vente à découvert impossible.')
         if quote.symbol!=p['symbol']: raise ValueError('Cotation différente de la position détenue.')
         if not all(math.isfinite(v) and v>0 for v in (quote.bid,quote.ask)) or quote.bid>quote.ask: raise ValueError('Cotation incohérente.')
         if not 0<=int(time.time()*1000)-quote.time_ms<=15000: raise ValueError('Cotation périmée : trop ancienne.')
     def sell(self,quote,reason,detail=None,price_cap=None):
-        p=self.store.position()
+        p=self.store.position(quote.symbol)
         if p and p.get('kind')=='cfd':
             return self._cfd_close(quote,reason,detail,price_cap)
         self.validate_quote(quote)
         if not math.isfinite(quote.bid) or quote.bid<=0 or quote.bid>quote.ask: raise ValueError('Cotation de sortie incohérente.')
         if not 0<=int(time.time()*1000)-quote.time_ms<=15000: raise ValueError('Sortie bloquée : cotation périmée.')
         with self.store.transaction():
-            p=self.store.position()
+            p=self.store.position(quote.symbol)
             if not p: raise ValueError('Aucune position détenue : vente à découvert impossible.')
             if quote.symbol!=p['symbol']: raise ValueError('Marché de sortie différent de la position.')
             price=min(quote.bid,price_cap) if price_cap is not None else quote.bid
@@ -58,19 +81,20 @@ class PaperExecutionEngine:
                   (utcnow(),fill,fee,p['entry_fee']+fee,net,reason,dumps(info),quote.bid,quote.ask,quote.time_ms,p['id']))
             self.store.set('cash',self.store.get('cash')+proceeds-fee)
             self.store.event(f'VENTE PAPER {p["symbol"]} : {reason} ; résultat net {net:+.2f} USDT.', 'warning' if net<0 else 'info')
+            self._trade_audit('CLOSE',{**p,'exit':fill,'net_pnl':net,'exit_reason':reason})
             return net
-    def protect(self,quote,allow_take_profit=True):
-        p=self.store.position()
+    def protect(self,quote,allow_take_profit=True,portfolio_quotes=None):
+        p=self.store.position(quote.symbol)
         if not p: return None
-        if p.get('kind')=='cfd': return self._cfd_protect(quote,allow_take_profit)
+        if p.get('kind')=='cfd': return self._cfd_protect(quote,allow_take_profit,portfolio_quotes)
         self.validate_quote(quote)
         if quote.bid<=p['stop_loss']: return self.sell(quote,'STOP_LOSS',{'method':'bid observé; gap exécuté au bid courant'})
         if allow_take_profit and quote.bid>=p['take_profit']: return self.sell(quote,'TAKE_PROFIT',{'method':'bid observé; plafond objectif prudent'},price_cap=p['take_profit'])
-        self.store.conn.execute('UPDATE trades SET last_market_at=? WHERE id=?',(quote.time_ms,p['id']))
+        self.store.conn.execute('UPDATE trades SET last_market_at=?,last_bid=?,last_ask=? WHERE id=?',(quote.time_ms,quote.bid,quote.ask,p['id']))
         return None
     def reconcile(self,quote,candles,since_time=None):
         """Backfilled M1 bars detect touches; execution is booked NOW, never as a historical live fill."""
-        p=self.store.position()
+        p=self.store.position(quote.symbol)
         if not p: return False
         if p.get('kind')=='cfd': return self._cfd_reconcile(quote,candles,since_time)
         since=p['last_market_at'] if since_time is None else since_time
@@ -110,7 +134,7 @@ class PaperExecutionEngine:
         if not 1<=plan.leverage<=5 or not math.isfinite(plan.entry_fee) or plan.entry_fee<0:
             raise ValueError('Levier ou frais CFD invalides.')
         with self.store.transaction():
-            if self.store.position(): raise ValueError('Une position est déjà ouverte.')
+            if self.store.position(plan.symbol): raise ValueError('Une position est déjà ouverte sur ce marché.')
             if self.store.rows('SELECT id FROM trades WHERE signal=?',(signal,)): raise ValueError('Signal déjà exécuté.')
             cost=plan.margin+plan.entry_fee; cash=self.store.get('cash')
             if cost>cash+1e-8: raise ValueError('Marge CFD et commissions : capital insuffisant.')
@@ -123,12 +147,15 @@ class PaperExecutionEngine:
                 'cfd',plan.direction,plan.margin,plan.leverage,1.,'USD',plan.fx_open,plan.financing_daily,now,plan.maintenance_margin_pct,quote.bid,quote.ask,fx_bid,fx_ask))
             self.store.set('cash',cash-cost)
             self.store.event(f'OUVERTURE CFD PAPER {plan.direction} {plan.symbol} : {plan.quantity:g} unités ; marge {plan.margin:.2f} USDT ; levier {plan.leverage:g}.')
-        return self.store.position()
+            opened=self.store.position(plan.symbol)
+        self._trade_audit('OPEN',opened,plan)
+        return opened
 
     def _cfd_close(self,quote,reason,detail=None,price_cap=None):
         fx_bid,fx_ask=self._validate_cfd_quote(quote)
         with self.store.transaction():
-            p=self.store.position()
+            p=self.store.position(quote.symbol)
+            if not p: raise ValueError('Aucune position détenue pour ce marché.')
             short=p['direction']=='SHORT'
             price=quote.ask if short else quote.bid
             if price_cap is not None:
@@ -151,16 +178,21 @@ class PaperExecutionEngine:
             # No zero clamp: a gap may lose more than collateral; it must remain visible.
             self.store.set('cash',self.store.get('cash')+p['margin']+gross-fee-financing)
             self.store.event(f'CLOTURE CFD PAPER {p["symbol"]} : {reason} ; résultat net {net:+.2f} USDT.', 'warning' if net<0 else 'info')
+            self._trade_audit('CLOSE',{**p,'exit':fill,'net_pnl':net,'exit_reason':reason})
             return net
 
-    def _cfd_protect(self,quote,allow_take_profit=True):
-        p=self.store.position()
+    def _cfd_protect(self,quote,allow_take_profit=True,portfolio_quotes=None):
+        p=self.store.position(quote.symbol)
         # Closed markets do not produce executable prices. Financing still appears in valuation.
         if getattr(quote,'market_status','')!='TRADEABLE': return None
         fx_bid,fx_ask=self._validate_cfd_quote(quote)
         short=p['direction']=='SHORT'; price=quote.ask if short else quote.bid
-        valuation=cfd_valuation(p,quote)
-        if self.store.get('cash')+valuation['equity_add']<=p['margin']*p['maintenance_margin_pct']/100:
+        observed=dict(portfolio_quotes or {}); observed[quote.symbol]=quote
+        with self.store.lock:
+            values=portfolio_valuations(self.store,observed)
+            equity=self.store.get('cash')+sum(row['equity_add'] for row in values)
+            maintenance=sum(row.get('margin',0.)*row.get('maintenance_margin_pct',50.)/100 for row in values if row.get('kind')=='cfd')
+        if equity<=maintenance:
             return self._cfd_close(quote,'MARGIN_STOP_OUT',{'method':'Equity sous marge de maintenance ; cotation exécutable courante.'})
         if (price>=p['stop_loss'] if short else price<=p['stop_loss']):
             return self._cfd_close(quote,'STOP_LOSS',{'method':'Ask observé pour SHORT, bid pour LONG ; gap au cours courant.'})
@@ -176,7 +208,7 @@ class PaperExecutionEngine:
         return None
 
     def _cfd_reconcile(self,quote,candles,since_time=None):
-        p=self.store.position()
+        p=self.store.position(quote.symbol)
         if getattr(quote,'market_status','')!='TRADEABLE': return False
         self._validate_cfd_quote(quote)
         since=p['last_market_at'] if since_time is None else since_time
@@ -223,3 +255,26 @@ def cfd_valuation(p,quote=None,now_ms=None):
     return dict(current_price=market,valuation_stale=quote is None or not 0<=int(time.time()*1000)-quote.time_ms<=15000,
         valuation_at=getattr(quote,'time_ms',p.get('last_market_at')),financing_usdt=financing,unrealized_pnl=gross-fee-financing-p['entry_fee'],
         equity_add=p['margin']+gross-fee-financing,margin_used=p['margin'],exit_fee_estimate=fee)
+
+
+
+def portfolio_valuations(store,quotes):
+    """Value every holding once. Missing quotes use labelled last observations.
+
+    No execution or account mutation occurs here. Native CFD prices are USD;
+    collateral, converted PnL and portfolio totals are USDT.
+    """
+    positions=[]; now=int(time.time()*1000)
+    for p in store.positions():
+        q=quotes.get(p['symbol'])
+        if p.get('kind')=='cfd':
+            p.update(cfd_valuation(p,q,now_ms=now))
+        else:
+            market=q.bid if q else p.get('last_bid') or p['entry']
+            net_exit=market*(1-p['slippage_bps']/10000)*(1-p['fee_rate'])
+            p.update(current_price=market,unrealized_pnl=p['quantity']*(net_exit-p['entry'])-p['entry_fee'],
+                equity_add=p['quantity']*net_exit,margin_used=0.,financing_usdt=0.,
+                valuation_stale=q is None or not 0<=now-q.time_ms<=15000,
+                valuation_at=q.time_ms if q else p.get('last_market_at'))
+        positions.append(p)
+    return positions

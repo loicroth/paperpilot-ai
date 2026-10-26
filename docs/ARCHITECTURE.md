@@ -6,10 +6,10 @@ Un serveur Python FastAPI et une boucle asynchrone, une base SQLite et une inter
 
 1. Binance fournit `exchangeInfo`, `klines`, `bookTicker` et l'heure serveur depuis `https://data-api.binance.vision/api/v3/`.
 2. L’heure serveur Binance détermine les bornes M5/H1 en millisecondes UTC. Le moteur conserve uniquement les bougies clôturées et calcule EMA, RSI, MACD, ATR, volumes et structure H1/M5. Il identifie les configurations autorisées.
-3. À chaque nouvelle clôture M5, un seul appel OpenAI compare les marchés et le portefeuille. Une réponse structurée contient BUY, SELL, HOLD ou WAIT, les niveaux, la confirmation et les risques.
+3. À chaque nouvelle clôture M5, un appel de gestion cible une position en rotation (schéma HOLD/SELL), et un appel d'entrée peut comparer les marchés admissibles (schéma WAIT/BUY/SHORT). Ils partagent les plafonds API existants. Chaque réponse est limitée aux actions et symboles de son mode.
 4. Une validation stricte vérifie la réponse. Le moteur de risque, indépendant du modèle, contrôle fraîcheur, admissibilité, nombre de positions, solde, frais, glissement, ratio net, stop, montant et pas de quantité Binance.
 5. `PaperExecutionEngine` simule un achat sur ask et une vente sur bid, avec glissement défavorable. Les écritures du portefeuille et de l'historique sont persistantes et protègent contre les doublons.
-6. La surveillance des cotations protège la position plus souvent que les analyses M5. Un rattrapage M1 après interruption signale les hypothèses ou l'incertitude ; en cas d'ambiguïté stop/objectif, le stop est prioritaire.
+6. La surveillance des cotations protège toutes les positions plus souvent que les analyses M5. Un rattrapage M1 par position après interruption signale les hypothèses ou l'incertitude ; en cas d'ambiguïté stop/objectif, le stop est prioritaire.
 
 Les décisions et erreurs sont conservées pour inspection. L'interface affiche les données existantes uniquement ; elle ne remplit jamais un historique fictif.
 
@@ -19,7 +19,10 @@ Les décisions et erreurs sont conservées pour inspection. L'interface affiche 
 - Le budget API est réservé avant l'appel. Une erreur, un format incomplet, un refus, une absence de clé ou une incompatibilité de modèle produit WAIT.
 - Un signal M5 consommé ne peut pas créer deux achats après rafraîchissement ou redémarrage.
 - Le statut « ACTIVE » décrit l'état opérationnel ; il ne prédit pas une performance.
-- Le risque de 1 % est un plafond de perte théorique avec les hypothèses d'exécution retenues. Les gaps ou interruptions peuvent le dépasser.
+- Le risque habituel est de 1 %, plafonné à 1,4 % par trade et à 2 % cumulé par défaut. Ces budgets correspondent aux pertes estimées avec les hypothèses d'exécution ; les gaps ou interruptions peuvent les dépasser.
+- Les niveaux M5/H1 sont extraits indépendamment du modèle. Le stop dépasse une référence structurelle avec une marge ATR ; l'objectif reste avant le premier obstacle connu. Une impossibilité d'atteindre 2R net produit un refus, sans modification des niveaux.
+- Le risque cumulé est mesuré du cours observé jusqu'aux stops, sans compenser les pertes possibles par des gains latents. Des données de position absentes ou périmées bloquent les nouvelles entrées.
+- La migration SQLite v3 sauvegarde la base existante puis remplace l'unicité globale par une unicité du symbole ouvert. Les anciennes positions et leur historique sont conservés.
 - La perte quotidienne utilise le portefeuille de début de journée UTC ; un dépassement suspend les entrées jusqu'au jour suivant.
 - Le spread REST est observé à réception : `bookTicker` ne fournit pas d'horodatage d'événement. La fraîcheur mesure l'observation serveur, pas une garantie de liquidité future.
 - SQLite et le verrou d'instance imposent un seul moteur sur un même dossier de données. Ne lancez pas plusieurs workers Uvicorn.

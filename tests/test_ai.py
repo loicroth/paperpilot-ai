@@ -1,7 +1,7 @@
 import json
 import httpx
 import pytest
-from app.ai import AIClient, Decision, MAX_OUTPUT_TOKENS, wait
+from app.ai import AIClient, Decision, MAX_OUTPUT_TOKENS, decision_schema, validate_context, wait
 
 
 def proposal(**changes):
@@ -255,3 +255,178 @@ async def test_invalid_input_is_distinct_and_never_calls_provider():
     assert result.decision.action == 'WAIT' and result.error
     assert (result.input_tokens, result.output_tokens) == (0, 0)
     assert 'sk-private' not in repr(result)
+
+
+def management_context(**changes):
+    return context(mode='management', managed_symbol='BTCUSDT', symbols=['BTCUSDT'],
+                   positions=[{'symbol': 'BTCUSDT', 'quantity': 1.}],
+                   portfolio={'open_count': 2, 'max_positions': 3}, **changes)
+
+
+def passive_proposal(action='HOLD', symbol='BTCUSDT', **changes):
+    return proposal(action=action, symbol=symbol, entry=None, stop_loss=None, take_profit=None,
+                    invalidation=None, setup='none', confirmation_met=False, risk_pct=None, **changes)
+
+
+def test_management_schema_can_only_manage_target_without_new_plan():
+    schema = decision_schema(management_context())
+    props = schema['properties']
+    assert props['action'] == {'type': 'string', 'enum': ['HOLD', 'SELL']}
+    assert props['symbol'] == {'type': 'string', 'enum': ['BTCUSDT']}
+    assert schema['additionalProperties'] is False
+    assert set(schema['required']) == set(Decision.model_fields)
+    for name in ('entry', 'stop_loss', 'take_profit', 'invalidation', 'risk_pct'):
+        assert props[name] == {'type': 'null'}
+    assert props['setup']['enum'] == ['none']
+    assert props['confirmation_met']['enum'] == [False]
+    assert all('default' not in prop for prop in props.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['HOLD', 'SELL'])
+async def test_management_request_uses_target_schema_and_accepts_valid_management(action):
+    calls = []
+    def handler(request):
+        payload = json.loads(request.content)
+        schema = payload['text']['format']['schema']
+        calls.append(schema)
+        assert schema['properties']['action']['enum'] == ['HOLD', 'SELL']
+        assert schema['properties']['symbol']['enum'] == ['BTCUSDT']
+        return httpx.Response(200, json=response_body(passive_proposal(action)))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await AIClient('fixture-key', client=http).decide(management_context())
+    assert len(calls) == 1 and result.error is None
+    assert result.decision.action == action and result.decision.risk_pct is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('data,code', [
+    (proposal(), 'management_action'),
+    (passive_proposal('WAIT'), 'management_action'),
+    (passive_proposal(symbol='ETHUSDT'), 'management_symbol'),
+])
+async def test_local_validation_blocks_management_mode_violation_even_if_provider_ignores_schema(data, code):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=response_body(data)))) as http:
+        result = await AIClient('fixture-key', client=http).decide(management_context())
+    assert result.error_kind == 'invalid_decision' and result.diagnostic['code'] == code
+    assert result.decision.action == 'WAIT' and result.error
+
+
+def test_entry_schema_excludes_held_symbols_and_forbids_management():
+    ctx = context(mode='entry', positions=[{'symbol': 'BTCUSDT', 'quantity': 1.}],
+                  portfolio={'open_count': 1, 'max_positions': 3})
+    props = decision_schema(ctx)['properties']
+    assert props['action']['enum'] == ['WAIT', 'BUY']
+    assert props['symbol']['enum'] == ['ALL', 'ETHUSDT', 'SOLUSDT']
+    assert 'risk_pct' in decision_schema(ctx)['required']
+    assert props['risk_pct']['anyOf'][0]['maximum'] == 1.4
+
+
+def test_entry_schema_allows_short_only_for_authorized_cfd_candidates():
+    ctx = context(mode='entry', symbols=['CAP:NVDA'], directions={'CAP:NVDA': ['SHORT']},
+                  rules={'allow_short': True, 'cfd_enabled': True},
+                  portfolio={'open_count': 0, 'max_positions': 3})
+    assert decision_schema(ctx)['properties']['action']['enum'] == ['WAIT', 'SHORT']
+    ctx['rules']['allow_short'] = False
+    assert decision_schema(ctx)['properties']['action']['enum'] == ['WAIT']
+
+
+@pytest.mark.parametrize('positions,count', [
+    ([{'symbol': 'BTCUSDT', 'quantity': 1.}], 3),
+    ([{'symbol': s, 'quantity': 1.} for s in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT')], 0),
+])
+def test_entry_schema_and_validator_block_full_portfolio_even_if_count_underreports(positions, count):
+    ctx = context(mode='entry', symbols=['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'ADAUSDT'],
+                  positions=positions, candidates={'ADAUSDT': ['breakout']},
+                  portfolio={'open_count': count, 'max_positions': 3})
+    schema = decision_schema(ctx)
+    assert schema['properties']['action']['enum'] == ['WAIT']
+    assert schema['properties']['risk_pct'] == {'type': 'null'}
+    with pytest.raises(ValueError, match='Capacité'):
+        validate_context(Decision.model_validate(proposal(symbol='ADAUSDT')), ctx)
+
+
+@pytest.mark.asyncio
+async def test_entry_can_buy_different_symbol_with_existing_positions_and_capacity():
+    data = proposal(symbol='ETHUSDT', risk_pct=1.4)
+    ctx = context(mode='entry', symbols=['ETHUSDT'], candidates={'ETHUSDT': ['breakout']},
+                  positions=[{'symbol': 'BTCUSDT', 'quantity': 1.}],
+                  portfolio={'open_count': 1, 'max_positions': 3})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=response_body(data)))) as http:
+        result = await AIClient('fixture-key', client=http).decide(ctx)
+    assert result.error is None and result.decision.action == 'BUY'
+    assert result.decision.risk_pct == 1.4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('data,code', [
+    (proposal(), 'position_already_open'),
+    (passive_proposal('HOLD'), 'entry_action'),
+    (passive_proposal('SELL'), 'entry_action'),
+])
+async def test_entry_local_guards_block_reinforcement_and_management(data, code):
+    ctx = context(mode='entry', positions=[{'symbol': 'BTCUSDT', 'quantity': 1.}],
+                  portfolio={'open_count': 1, 'max_positions': 3})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=response_body(data)))) as http:
+        result = await AIClient('fixture-key', client=http).decide(ctx)
+    assert result.error_kind == 'invalid_decision' and result.diagnostic['code'] == code
+    assert result.decision.action == 'WAIT' and result.error
+
+
+def test_entry_wait_cannot_use_a_held_symbol_excluded_from_schema():
+    ctx = context(mode='entry', positions=[{'symbol': 'BTCUSDT', 'quantity': 1.}],
+                  portfolio={'open_count': 1, 'max_positions': 3})
+    with pytest.raises(ValueError, match='déjà détenu'):
+        validate_context(Decision.model_validate(passive_proposal('WAIT')), ctx)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_cannot_execute_market_proposal_even_if_provider_ignores_schema():
+    ctx = context(diagnostic_only=True, portfolio={'open_count': 0, 'max_positions': 3})
+    def handler(request):
+        props = json.loads(request.content)['text']['format']['schema']['properties']
+        assert props['action']['enum'] == ['WAIT'] and props['symbol']['enum'] == ['ALL']
+        return httpx.Response(200, json=response_body(proposal()))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await AIClient('fixture-key', client=http).decide(ctx)
+    assert result.error_kind == 'invalid_decision' and result.diagnostic['code'] == 'diagnostic_action'
+    assert result.decision.action == 'WAIT' and result.error
+
+
+@pytest.mark.parametrize('risk', [None, 0.25, 1., 1.4])
+def test_entry_risk_is_nullable_and_bounded(risk):
+    assert Decision.model_validate(proposal(risk_pct=risk)).risk_pct == risk
+
+
+@pytest.mark.parametrize('risk', [0., -1., 1.40001, float('nan'), float('inf'), '1.4', True])
+def test_invalid_entry_risk_is_rejected(risk):
+    with pytest.raises(ValueError):
+        Decision.model_validate(proposal(risk_pct=risk))
+
+
+@pytest.mark.parametrize('action', ['WAIT', 'HOLD', 'SELL'])
+def test_passive_or_exit_action_cannot_set_risk(action):
+    data = passive_proposal(action)
+    data['risk_pct'] = 1.
+    with pytest.raises(ValueError, match='Risque réservé'):
+        Decision.model_validate(data)
+
+
+@pytest.mark.asyncio
+async def test_management_missing_target_blocks_before_any_api_call():
+    def handler(request):
+        pytest.fail('Missing management target must not make an API call')
+    ctx = management_context()
+    ctx['managed_symbol'] = 'UNKNOWN-PRIVATE'
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await AIClient('fixture-key', client=http).decide(ctx)
+    assert result.error_kind == 'invalid_input' and result.error
+    assert 'UNKNOWN-PRIVATE' not in repr(result)
+
+
+def test_dynamic_schema_does_not_mutate_later_mode_or_base_model_schema():
+    decision_schema(management_context())
+    schema = decision_schema(context(mode='entry', portfolio={'open_count': 0, 'max_positions': 3}))
+    assert schema['properties']['action']['enum'] == ['WAIT', 'BUY']
+    assert 'anyOf' in schema['properties']['entry']
+    assert set(Decision.model_json_schema()['properties']['action']['enum']) == {'BUY', 'SHORT', 'SELL', 'HOLD', 'WAIT'}

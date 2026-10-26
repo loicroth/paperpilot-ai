@@ -2,7 +2,7 @@
 import pytest
 from app.config import Settings
 from app.ai import Decision,validate_context,wait
-from app.market import Quote,Rules,MarketError
+from app.market import Candle,Quote,Rules,MarketError
 from test_engine import rig
 
 
@@ -14,7 +14,7 @@ def configure(rig,monkeypatch):
     engine,store,market,ai,env=rig
     store.set('settings',Settings(cfd_enabled=True,auto_scanner=False).model_dump())
     async def symbols(limit): return ['CAP:NVDA']
-    oq=market.quote;orr=market.rules
+    oq=market.quote;orr=market.rules;oc=market.candles
     async def quote(symbol):
         if symbol.startswith('CAP:'):return Quote(symbol,100.,100.02,market.now,currency='USD',conversion_rate=1.001,conversion_bid=.999,conversion_ask=1.001)
         return await oq(symbol)
@@ -23,8 +23,16 @@ def configure(rig,monkeypatch):
         for s in symbols:
             if s.startswith('CAP:'):result[s]=Rules(s,.01,1000,.01,0,1e9,.01,asset_class='share_cfd',provider='capital_demo',currency='USD',min_margin_pct=20,allow_short=True)
         return result
+    async def candles(symbol,interval,limit=150,start_time=None,end_time=None):
+        rows=await oc(symbol,interval,limit,start_time,end_time)
+        if not symbol.startswith('CAP:'):return rows
+        # Mirror the bullish closed-bar fixture: confirmed resistance near101.5
+        # protects the SHORT stop102 and the old H1 support92 bounds its target93.
+        return [Candle(c.open_time,c.close_time,200-c.open,200-c.low,200-c.high,
+                       200-c.close,c.volume,c.volume_available) for c in rows]
     monkeypatch.setattr(market,'cfd_symbols',symbols,raising=False)
     monkeypatch.setattr(market,'quote',quote);monkeypatch.setattr(market,'rules',rules)
+    monkeypatch.setattr(market,'candles',candles)
     monkeypatch.setattr('app.engine.candidates',lambda a,b,**kwargs:[])
     monkeypatch.setattr('app.engine.short_candidates',lambda a,b,**kwargs:['breakout'])
     ai.proposal=short()
@@ -64,7 +72,7 @@ async def test_wrong_side_is_rejected_independently_of_ai_client(rig,monkeypatch
     ai.proposal=short().model_copy(update={'action':'BUY','stop_loss':98.,'take_profit':107.,'invalidation':98.})
     await engine._analyze()
     assert store.position() is None
-    assert 'Direction' in store.rows('SELECT rejection FROM decisions')[-1]['rejection']
+    assert 'direction' in store.rows('SELECT rejection FROM decisions')[-1]['rejection'].lower()
 
 
 @pytest.mark.asyncio

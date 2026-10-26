@@ -11,6 +11,7 @@ from app.engine import TradingEngine
 from app.market import Candle, MarketError, Quote, Rules
 from app.risk import RiskEngine
 from app.storage import Store
+from test_structural_risk import structural_fixture
 
 
 class RecoveryMarket:
@@ -60,7 +61,8 @@ def recovery(tmp_path, monkeypatch):
         entry=100.02, stop_loss=98., take_profit=107., invalidation=98.,
         confirmation='Fixture clôturée.', risks=['Interruption'], setup='breakout', confirmation_met=True)
     rules = Rules('BTCUSDT', .001, 1000., .001, 5., 1e9, .01)
-    plan = RiskEngine.plan(proposal, quote, rules, settings, 900., 900., atr=1.013, now_ms=clock['now'])
+    plan = RiskEngine.plan(proposal, quote, rules, settings, 900., 900., atr=1.013,
+        now_ms=clock['now'], structure_context=structural_fixture(proposal, 1.013, clock['now']))
     engine.paper.buy(plan, quote, 'before-gap', proposal, settings, {})
     yield SimpleNamespace(base=base, clock=clock, path=path, store=store, env=env,
         market=market, engine=engine, settings=settings)

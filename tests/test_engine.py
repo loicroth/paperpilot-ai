@@ -10,6 +10,7 @@ import pytest
 from app.ai import AIClient, AIResult, Decision, wait
 from app.config import Settings
 from app.engine import TradingEngine
+from app.indicators import snapshot
 from app.market import Candle, MarketError, Quote, Rules
 from app.risk import RiskEngine
 from app.storage import Store
@@ -49,10 +50,18 @@ class MarketFixture:
             end -= duration
         result = []
         for i in range(150):
-            close = (97.5 + i * .01 if interval == '5m' else 90 + i * .08) + .4 * math.sin(i * 1.2)
+            if interval == '5m':
+                close = 97.5 + i * .01 + .2 * math.sin(i * 1.2)
+            elif interval == '1h':
+                close = 88. + i * .076
+            else:
+                close = 90 + i * .08 + .4 * math.sin(i * 1.2)
             op = close - .12
+            # The older H1 pivot is a genuine observed target obstacle, retained
+            # in the raw40-bar structure even when the AI payload is trimmed.
+            high = 108. if interval == '1h' and i == 120 else close + .35
             result.append(Candle(end - (149-i) * duration - duration + 1,
-                end - (149-i) * duration, op, close + .45, op - .45, close, 100.))
+                end - (149-i) * duration, op, high, op - .35, close, 100.))
         if interval == '5m':
             c = result[-1]
             result[-1] = Candle(c.open_time, c.close_time, 99.6, 100.3, 99.4, 100., 200.)
@@ -230,7 +239,10 @@ async def test_protection_runs_while_ai_waits_and_stale_hold_is_rejected(rig):
     q = engine.quotes['BTCUSDT']
     rules = (await market.rules(['BTCUSDT']))['BTCUSDT']
     decision = buy_decision()
-    plan = RiskEngine.plan(decision, q, rules, cfg, 900., 900., atr=1.013, now_ms=market.now)
+    structure_context = {name:snapshot(await market.candles('BTCUSDT', interval))
+                         for name,interval in [('m5','5m'),('h1','1h')]}
+    plan = RiskEngine.plan(decision, q, rules, cfg, 900., 900.,
+        atr=structure_context['m5']['atr14'], now_ms=market.now,structure_context=structure_context)
     engine.paper.buy(plan, q, 'fixture-position-before-call', decision, cfg, {})
     ai.proposal = Decision(symbol='BTCUSDT', action='HOLD', reason='Conserver fixture.',
         entry=None, stop_loss=None, take_profit=None, invalidation=None,
@@ -246,7 +258,7 @@ async def test_protection_runs_while_ai_waits_and_stale_hold_is_rejected(rig):
     ai.release.set()
     await task
     assert store.position() is None
-    assert 'HOLD sans position' in store.rows('SELECT * FROM decisions')[0]['rejection']
+    assert 'Position de gestion clôturée ou remplacée' in store.rows('SELECT * FROM decisions')[0]['rejection']
 
 
 @pytest.mark.asyncio

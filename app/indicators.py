@@ -74,7 +74,8 @@ def candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
     """Deterministic LONG setup admission; IA chooses at most one admissible market.
 
     Breakout, retest, consolidation resumption need an upward H1 context.
-    Reversal additionally needs an improving H1 structure above EMA21.
+    Reversal also needs the established H1 alignment; an early neutral-H1
+    bounce alone does not qualify as an entry.
     These are constraints, not a claim of a profitable edge.
     """
     volume_ok = lambda threshold: (not require_volume and not m5.get("volume_available",True)) or m5["volume_ratio"] >= threshold
@@ -108,7 +109,7 @@ def candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
         older_low = min(c["low"] for c in rows[-12:-6])
         newer_low = min(c["low"] for c in rows[-6:-1])
         pivot = max(c["high"] for c in rows[-4:-1])
-        if newer_low > older_low and close > pivot and close > m5["ema21"] and m5["macd_hist"] > m5["macd_hist_previous"] and volume_ok(1.2):
+        if uptrend and newer_low > older_low and close > pivot and close > m5["ema21"] and m5["macd_hist"] > m5["macd_hist_previous"] and volume_ok(1.2):
             result.append("reversal")
     return result
 
@@ -140,5 +141,6 @@ def long_refusals(m5: dict, h1: dict) -> list[str]:
     if last['close']<=last['open']:reasons.append('Bougie M5 non haussière')
     if h1['last']['close']<h1['ema21']:reasons.append('H1 sous EMA21 : achat non autorisé')
     if h1['ema21']<h1['ema21_previous']:reasons.append('EMA21 H1 descendante')
+    if h1['ema21']<=h1['ema50']:reasons.append('Tendance H1 non confirmée : EMA21 sous EMA50')
     if not reasons:reasons.append('Cassure, retest, reprise ou retournement confirmé absent ; volume éventuellement insuffisant')
     return reasons
