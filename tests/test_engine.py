@@ -298,8 +298,9 @@ def test_daily_loss_latch_does_not_clear_after_recovery_until_next_utc_day(rig):
 
 
 @pytest.mark.asyncio
-async def test_decision_delayed_more_than_65_seconds_cannot_open(rig):
+async def test_decision_delayed_more_than_65_seconds_cannot_open(rig, monkeypatch):
     engine, store, market, ai, _ = rig
+    monkeypatch.setattr('app.engine.time.time', lambda: market.now / 1000)
     ai.release = asyncio.Event()
     task = asyncio.create_task(engine._analyze())
     await ai.entered.wait()
@@ -333,9 +334,12 @@ async def test_structured_ai_adapter_integrates_with_real_indicator_context(rig)
         payload = json.loads(request.content)
         observed = json.loads(payload['input'][0]['content'][0]['text'])
         payloads.append(observed)
+        chosen=next(p for p in observed['entry_plans'] if p['symbol']=='BTCUSDT')
+        selection={'choice':{'id':chosen['id'],'risk_pct':None},
+            'reason':'Cassure confirmée avec volume.', 'confirmation':'Clôture observée.', 'risks':['Faux breakout']}
         return httpx.Response(200, json={
             'status': 'completed', 'usage': {'input_tokens': 800, 'output_tokens': 150},
-            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': buy_decision().model_dump_json()}]}],
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(selection)}]}],
         })
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         ai = AIClient('fixture-key-never-live', client=http)
@@ -411,8 +415,8 @@ async def test_metadata_delay_refetches_quote_and_revalidates_price_drift(rig,mo
 
 
 @pytest.mark.asyncio
-async def test_risk_rechecks_quote_age_against_local_clock_before_execution(rig,monkeypatch):
-    """A malformed future quote must fail risk validation, not just the final executor."""
+async def test_future_quote_blocks_before_ai_selection_or_execution(rig,monkeypatch):
+    """A malformed future quote cannot be used to propose or execute an entry."""
     engine,store,market,ai,_=rig
     monkeypatch.setattr('app.engine.candidates',lambda m5,h1:['breakout'])
     original=market.quote
@@ -425,4 +429,6 @@ async def test_risk_rechecks_quote_age_against_local_clock_before_execution(rig,
     monkeypatch.setattr(engine.paper,'buy',forbidden_buy)
     await engine._analyze()
     assert store.position() is None
-    assert 'horodatage futur' in store.rows('SELECT rejection FROM decisions')[-1]['rejection']
+    assert ai.contexts == []
+    assert all('horodatage futur' in row['reason'] for row in engine.scan['rows'])
+

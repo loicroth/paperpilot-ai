@@ -84,6 +84,21 @@ class AIResult:
     diagnostic: dict | None = None
 
 
+class _PlanChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=180)
+    risk_pct: float | None = Field(gt=0, le=1.4)
+
+
+class _EntrySelection(BaseModel):
+    """The model selects an observed plan; it never rewrites its price levels."""
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    choice: _PlanChoice
+    reason: str = Field(min_length=1, max_length=1400)
+    confirmation: str = Field(min_length=1, max_length=1000)
+    risks: list[str] = Field(max_length=10)
+
+
 def _failure(kind, stage, code, reason, input_tokens=0, output_tokens=0, issues=None):
     """Only application-owned text may cross this diagnostic boundary."""
     message = f"Décision OpenAI invalide : {reason} WAIT." if kind == "invalid_decision" else reason
@@ -204,8 +219,64 @@ def _portfolio_full(context: dict, held: set[str]) -> bool:
     return max(count, len(held)) >= capacity
 
 
+def _entry_plan_map(context: dict) -> dict[str, dict]:
+    plans = context.get("entry_plans")
+    if not isinstance(plans, list) or len(plans) > 80:
+        raise ValueError("Catalogue de plans d’entrée invalide")
+    result = {}
+    for plan in plans:
+        if not isinstance(plan, dict):
+            raise ValueError("Plan d’entrée invalide")
+        identifier = plan.get("id")
+        if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 180 or identifier == "WAIT" or identifier in result:
+            raise ValueError("Identifiant de plan d’entrée invalide")
+        levels = {key: plan[key] for key in ("symbol", "action", "setup", "entry", "stop_loss", "take_profit", "invalidation")}
+        if levels["action"] not in {"BUY", "SHORT"}:
+            raise ValueError("Sens de plan d’entrée invalide")
+        decision = Decision(**levels, reason="Plan observé fourni par le moteur.",
+                            confirmation="Configuration déterministe observée.", risks=[],
+                            confirmation_met=True, risk_pct=None)
+        validate_context(decision, context)
+        result[identifier] = levels
+    return result
+
+
+def _entry_selection_schema(context: dict) -> dict:
+    plans = _entry_plan_map(context)
+    schema = _EntrySelection.model_json_schema()
+    risk_schema = _PlanChoice.model_json_schema()["properties"]["risk_pct"]
+    def choice(identifiers, risk):
+        return {"type": "object", "properties": {
+            "id": {"type": "string", "enum": identifiers}, "risk_pct": risk},
+            "additionalProperties": False, "required": ["id", "risk_pct"]}
+    choices = [choice(["WAIT"], {"type": "null"})]
+    if plans:
+        choices.append(choice(list(plans), risk_schema))
+    schema["properties"]["choice"] = {"anyOf": choices}
+    schema.pop("$defs", None)
+    return schema
+
+
+def _compile_entry_selection(parsed: dict, context: dict) -> Decision:
+    selection = _EntrySelection.model_validate(parsed, strict=True)
+    identifier = selection.choice.id
+    if identifier == "WAIT":
+        if selection.choice.risk_pct is not None:
+            raise _DecisionRejected("decision_context", "risk_without_entry", "Le risque proposé doit être nul pour WAIT.")
+        return Decision(symbol="ALL", action="WAIT", entry=None, stop_loss=None,
+                        take_profit=None, invalidation=None, setup="none", confirmation_met=False,
+                        reason=selection.reason, confirmation=selection.confirmation, risks=selection.risks)
+    plan = _entry_plan_map(context).get(identifier)
+    if plan is None:
+        raise _DecisionRejected("decision_context", "unknown_entry_plan", "Le plan choisi est absent des configurations de marché fournies.")
+    return Decision(**plan, reason=selection.reason, confirmation=selection.confirmation,
+                    risks=selection.risks, confirmation_met=True, risk_pct=selection.choice.risk_pct)
+
+
 def decision_schema(context: dict) -> dict:
     """Constrain the provider response to this call; local validation remains mandatory."""
+    if context.get("mode") == "entry" and "entry_plans" in context:
+        return _entry_selection_schema(context)
     schema = Decision.model_json_schema()
     properties = schema["properties"]
     # Structured Outputs requires every property, including nullable defaults.
@@ -294,6 +365,7 @@ Pour les coûts, fee_rate concerne la crypto Spot ; cfd_fee_rate concerne les CF
 Renvoie UNE seule proposition JSON conforme au schéma de cet appel. Réponds en français. Respecte mode, managed_symbol et portfolio.
 Mode management : examine uniquement la position managed_symbol et son marché. Choisis HOLD pour la conserver ou SELL pour la clôturer si les faits observables justifient une sortie. Ne cherche aucune nouvelle entrée. SELL et HOLD utilisent entry, stop_loss, take_profit, invalidation et risk_pct null, setup none, confirmation_met false ; le plan existant n'est jamais déplacé.
 Mode entry : compare les marchés candidats pour UNE éventuelle nouvelle position, ou WAIT. Aucune vente ni gestion dans cet appel. N'ouvre jamais une nouvelle position sur un symbole déjà détenu ; respecte la capacité restante de portfolio et l'exposition déjà ouverte.
+Quand entry_plans est fourni, réponds avec choice, reason, confirmation et risks selon le schéma : choice.id est l'identifiant exact d'un plan fourni, ou WAIT. Choisis un plan uniquement si les faits observés justifient cette entrée ; sinon WAIT. choice.risk_pct est null pour le risque configuré, et toujours null pour WAIT. Les niveaux du plan sont calculés à partir du marché puis contrôlés à nouveau sur la cotation finale ; tu ne les inventes, recopies, arrondis ou modifies pas. Un plan proposé n'est ni un ordre validé ni une preuve de rentabilité. Les instructions sur les champs de prix ci-dessous décrivent le plan compilé par le moteur, pas des champs à ajouter à cette réponse de sélection.
 BUY seulement si la structure M5 clôturée confirme une configuration présente dans candidates pour ce symbole et si le contexte H1 l'autorise. Les filtres déterministes sont obligatoires, tu ne peux pas les contourner.
 Analyse EMA, RSI, MACD, ATR, supports/résistances, hauts/bas, volumes, bid/ask, portefeuille et règles de risque fournis. Identifie faux breakout, retest, consolidation, retournement confirmé et risques. Ne prétends pas connaître des prix futurs ni garantir des bénéfices. WAIT est normal quand l'avantage est insuffisant.
 Aucune moyenne à la baisse, martingale ou augmentation pour récupérer une perte. SHORT ouvre une position vendeuse uniquement sur un symbole CAP: autorisé par directions. Le levier CFD est fixé et vérifié par le moteur de risque, jamais choisi par toi. Aucun SHORT sur Binance Spot. SELL ferme seulement la position détenue demandée ; HOLD signifie la conserver.
@@ -389,7 +461,9 @@ class AIClient:
             stage = "output_json"
             parsed = json.loads(parts[0], object_pairs_hook=_unique_object)
             stage = "decision_schema"
-            decision = Decision.model_validate(parsed, strict=True)
+            decision = (_compile_entry_selection(parsed, context)
+                        if context.get("mode") == "entry" and "entry_plans" in context
+                        else Decision.model_validate(parsed, strict=True))
             stage = "decision_context"
             try:
                 validate_context(decision, context)

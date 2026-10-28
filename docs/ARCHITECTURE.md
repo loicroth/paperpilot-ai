@@ -6,7 +6,7 @@ Un serveur Python FastAPI et une boucle asynchrone, une base SQLite et une inter
 
 1. Binance fournit `exchangeInfo`, `klines`, `bookTicker` et l'heure serveur depuis `https://data-api.binance.vision/api/v3/`.
 2. L’heure serveur Binance détermine les bornes M5/H1 en millisecondes UTC. Le moteur conserve uniquement les bougies clôturées et calcule EMA, RSI, MACD, ATR, volumes et structure H1/M5. Il identifie les configurations autorisées.
-3. À chaque nouvelle clôture M5, un appel de gestion cible une position en rotation (schéma HOLD/SELL), et un appel d'entrée peut comparer les marchés admissibles (schéma WAIT/BUY/SHORT). Ils partagent les plafonds API existants. Chaque réponse est limitée aux actions et symboles de son mode.
+3. À chaque nouvelle clôture M5, le moteur vérifie les coûts et la géométrie de tous les candidats techniques dans un délai borné avant de remplir la présélection IA. Un appel de gestion cible une position en rotation (schéma HOLD/SELL). Pour une entrée, l'IA choisit un identifiant de plan de marché ou WAIT ; le moteur compile les niveaux inchangés. Les appels partagent les plafonds API existants. Sans plan vérifiable, aucun appel d'entrée n'est facturé.
 4. Une validation stricte vérifie la réponse. Le moteur de risque, indépendant du modèle, contrôle fraîcheur, admissibilité, nombre de positions, solde, frais, glissement, ratio net, stop, montant et pas de quantité Binance.
 5. `PaperExecutionEngine` simule un achat sur ask et une vente sur bid, avec glissement défavorable. Les écritures du portefeuille et de l'historique sont persistantes et protègent contre les doublons.
 6. La surveillance des cotations protège toutes les positions plus souvent que les analyses M5. Un rattrapage M1 par position après interruption signale les hypothèses ou l'incertitude ; en cas d'ambiguïté stop/objectif, le stop est prioritaire.
@@ -32,3 +32,4 @@ Les décisions et erreurs sont conservées pour inspection. L'interface affiche 
 La clé OpenAI reste dans l'environnement du serveur et ne fait partie ni des réponses API, ni des exports. Le serveur écoute localement par défaut. Les mutations ont une protection CSRF et un déploiement non local exige un mot de passe ; HTTPS reste à fournir par l'hébergement.
 
 `LiveExecutionEngine` existe uniquement comme frontière architecturale verrouillée. Aucun paramètre de cette V1 ne peut l'activer et aucune clé Binance n'est lue. Une future version réelle devra traiter les ordres protégés acceptés par Binance, les exécutions partielles, la réconciliation, les interruptions et l'arrêt d'urgence, puis être testée et faire l'objet d'une autorisation explicite.
+

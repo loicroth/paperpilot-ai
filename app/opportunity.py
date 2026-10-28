@@ -71,23 +71,36 @@ def market_feasibility(data, quote, rules, settings, short=False):
             return finish('missing_stop', 'Aucun pivot connu pour justifier un stop structurel.')
         rounding = ROUND_UP if short else ROUND_DOWN
 
+        tick = D(rules.tick_size)
+
         def rounded(price):
-            return float((D(price) / D(rules.tick_size)).to_integral_value(rounding=rounding) * D(rules.tick_size))
+            return (price / tick).to_integral_value(rounding=rounding) * tick
 
         # Both constraints refer to absolute prices, not a desired reward/risk.
-        stop = (max(anchor['price'] + levels['stop_buffer'], entry + .35 * atr) if short
-                else min(anchor['price'] - levels['stop_buffer'], entry - .35 * atr))
+        # Compute the margins before converting to a binary float. For example,
+        # 98.3 - .15 is 98.14999999999999 as a float: flooring that value would
+        # incorrectly spend an extra tick and can turn a valid 2R plan into WAIT.
+        anchor_price, entry_price, atr_price = D(anchor['price']), D(entry), D(atr)
+        stop_buffer, noise_floor = D('.15') * atr_price, D('.35') * atr_price
+        stop = (max(anchor_price + stop_buffer, entry_price + noise_floor) if short
+                else min(anchor_price - stop_buffer, entry_price - noise_floor))
         # A stop must allow an unbreached invalidation on the executable exit side.
-        stop = max(stop, math.nextafter(quote.ask, math.inf)) if short else min(stop, math.nextafter(quote.bid, -math.inf))
         stop = rounded(stop)
-        if sign * (entry - stop) < .35 * atr:
-            stop = rounded(stop - sign * rules.tick_size)
+        if (stop <= D(quote.ask) if short else stop >= D(quote.bid)):
+            stop = rounded(D(quote.ask if short else quote.bid))
+            if (stop <= D(quote.ask) if short else stop >= D(quote.bid)):
+                stop -= sign * tick
+        # RiskEngine enforces this same comparison on executable float prices.
+        # Retain a whole conservative tick if its float boundary needs one.
+        if sign * (entry - float(stop)) < .35 * atr:
+            stop -= sign * tick
+        stop = float(stop)
         if not math.isfinite(stop):
             return finish('unknown', 'Stop de référence non vérifiable.')
         result['reference_stop'] = stop
         if obstacle is None:
             return finish('missing_target', 'Aucun obstacle connu pour borner un objectif de marché.')
-        target = rounded(obstacle['price'] - sign * levels['target_buffer'])
+        target = float(rounded(D(obstacle['price']) - sign * D('.1') * atr_price))
         if not math.isfinite(target):
             return finish('unknown', 'Objectif de référence non vérifiable.')
         result['reference_target'] = target

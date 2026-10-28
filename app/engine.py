@@ -9,6 +9,7 @@ from .indicators import snapshot, candidates, short_candidates, long_refusals, s
 from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
 from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
 from .structure import structural_levels
+from .entry_plans import build_entry_plans
 from .execution import PaperExecutionEngine
 from .metrics import statistics
 from .storage import utcnow, dumps
@@ -16,6 +17,7 @@ from .scan_audit import scan_summary
 from .opportunity import market_feasibility
 
 log=logging.getLogger('paperpilot')
+ENTRY_EVALUATION_SECONDS=10.
 
 class TradingEngine:
     def __init__(self,store,env,market=None,ai=None):
@@ -68,7 +70,8 @@ class TradingEngine:
             if not self.store.reserve_usage(day,cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
                 raise ValueError('Budget API quotidien atteint : vérification IA non effectuée.')
             self.ai.model=cfg.model
-            result=await self.ai.decide({'diagnostic_only':True,'symbols':[],'markets':{},'candidates':{},'positions':[],
+            result=await self.ai.decide({'diagnostic_only':True,'mode':'entry','entry_plans':[],
+                'symbols':[],'markets':{},'candidates':{},'positions':[],
                 'cash':self.store.get('cash'),'rules':cfg.model_dump()})
             self.store.settle_usage(day,reserve,result.input_tokens+result.output_tokens)
             if result.error:
@@ -76,7 +79,7 @@ class TradingEngine:
                 raise ValueError(result.error)
             if result.decision.action!='WAIT': raise ValueError('Réponse de diagnostic IA non conforme.')
             self.health.update(ai_ok=True,ai_error=None,ai_error_kind=None)
-            log.info('PAPER_AI_CHECK connexion et format structurés vérifiés ; aucun ordre ni décision de marché.')
+            log.info('PAPER_AI_CHECK connexion et format de sélection de plan vérifiés ; aucun ordre ni décision de marché.')
         except asyncio.CancelledError: raise
         except Exception as exc:
             self.health.update(ai_ok=False,ai_error=str(exc)[:300],ai_error_kind=error_kind or 'operational')
@@ -410,6 +413,95 @@ class TradingEngine:
             try: self.error(message)
             except Exception: log.exception('Erreur critique : base indisponible ; entrées bloquées en mémoire.')
             self.health['ai_error']=message
+    async def _prepare_entry_candidates(self,ranked,rows,cfg,expected,expanded):
+        """Check every technical candidate before spending the bounded AI slots.
+
+        A high-volume but impossible plan must not hide a lower-ranked valid
+        market. These bounds only exclude demonstrably impossible directions;
+        unknown bounds remain visible behind verified feasible candidates.
+        """
+        if not ranked:return []
+        by_symbol={row['symbol']:row for row in rows}
+        crypto=[item[0] for item in ranked if not item[0].startswith('CAP:')]
+        # Binance returns one exchangeInfo batch. CFD metadata is isolated by
+        # symbol so one bad contract cannot discard the other valid markets.
+        crypto_rules=asyncio.create_task(self.market.rules(crypto)) if crypto else None
+        slots={'crypto':asyncio.Semaphore(4),'cfd':asyncio.Semaphore(2)}
+        impossible={'missing_stop','missing_target','invalid_levels','insufficient_rr'}
+        async def evaluate(item):
+            symbol,data,setups=item
+            cfd=symbol.startswith('CAP:')
+            async with slots['cfd' if cfd else 'crypto']:
+                found=(await self.market.rules([symbol])) if cfd else await asyncio.shield(crypto_rules)
+                rules=found[symbol]
+                q=await self.market.quote(symbol)
+                if q.symbol!=symbol:raise MarketError('Cotation de validation sur un autre marché.')
+                if not 0<=int(time.time()*1000)-q.time_ms<=15000:
+                    raise MarketError('Cotation trop ancienne ou horodatage futur.')
+                self.rules[symbol]=rules;self.quotes[symbol]=q;data['quote']=asdict(q)
+                data['structure']={side:structural_levels(data,entry=q.ask if side=='BUY' else q.bid,
+                    direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1) for side in data['directions']}
+                bounds={side:market_feasibility(data,q,rules,cfg,short=side=='SHORT') for side in data['directions']}
+                data['feasibility']=bounds
+                row=by_symbol[symbol];row['feasibility']=bounds
+                row['technical_candidate']=True
+                row['reason']+=' — '+' | '.join(side+' : '+bound['reason'] for side,bound in bounds.items())
+                allowed=[side for side in data['directions'] if bounds[side].get('status') not in impossible]
+                if not allowed:
+                    row['status']='ATTENTE'
+                    return None
+                # Keep the full bounds for diagnostics, but do not offer an
+                # impossible side to the model when the opposite side is valid.
+                data['directions']=allowed
+                data['direction_candidates']={side:values if side in allowed else []
+                    for side,values in data['direction_candidates'].items()}
+                setups=list(dict.fromkeys(setup for side in allowed for setup in data['direction_candidates'][side]))
+                priority=0 if any(bounds[side].get('status')=='feasible' for side in allowed) else 1
+                return (symbol,data,setups),priority
+        tasks={item[0]:asyncio.create_task(evaluate(item)) for item in ranked}
+        try:
+            remaining=max(0.,min(ENTRY_EVALUATION_SECONDS,(expected+48000-await self.market.server_time())/1000))
+            _,pending=await asyncio.wait(list(tasks.values()),timeout=remaining)
+            for task in pending:task.cancel()
+            await asyncio.gather(*pending,return_exceptions=True)
+            prepared=[]
+            for item in ranked:
+                symbol=item[0];task=tasks[symbol]
+                try:
+                    if task in pending:raise MarketError('Délai de validation économique dépassé ; marché ignoré pour ce cycle.')
+                    result=task.result()
+                except (Exception,asyncio.CancelledError) as exc:
+                    by_symbol[symbol].update(status='INDISPONIBLE',reason='Validation avant analyse IA indisponible : '+str(exc)[:180])
+                else:
+                    if result is not None:prepared.append(result)
+        finally:
+            owned=[*tasks.values()]+([crypto_rules] if crypto_rules is not None else [])
+            for task in owned:
+                if not task.done():task.cancel()
+            await asyncio.gather(*owned,return_exceptions=True)
+        def family_order(items):
+            if not (expanded and cfg.cfd_enabled):return items
+            families={}
+            for item in items:families.setdefault(item[1]['instrument'].get('asset_class','unknown'),[]).append(item)
+            order=list(families)
+            if order:
+                offset=(expected//300000)%len(order);order=order[offset:]+order[:offset]
+            ordered=[]
+            while order:
+                next_order=[]
+                for family in order:
+                    ordered.append(families[family].pop(0))
+                    if families[family]:next_order.append(family)
+                order=next_order
+            return ordered
+        ordered=[]
+        for priority in (0,1):ordered.extend(family_order([item for item,p in prepared if p==priority]))
+        selected=ordered[:cfg.ai_shortlist] if expanded else ordered
+        selected_symbols={item[0] for item in selected}
+        for item in ordered:
+            if item[0] not in selected_symbols:
+                by_symbol[item[0]]['selection_reason']='Limite de présélection IA ; les configurations faisables sont prioritaires.'
+        return selected
     async def _analyze(self):
         cfg=self.settings(); revision=self._settings_revision
         held=self.store.positions()
@@ -506,49 +598,13 @@ class TradingEngine:
                 messages='; '.join(row['reason'] for row in rows[:3])
                 raise MarketError('Aucun marché analysable sur ce cycle. '+messages)
             ranked=sorted((r for r in valid if r[2] and r[0] not in held_symbols),key=lambda r:(-r[1]['m5']['volume_ratio'],r[0]))
-            entry_results=ranked[:cfg.ai_shortlist] if expanded else [r for r in valid if r[0] not in held_symbols]
-            if expanded and cfg.cfd_enabled:
-                families={}
-                for item in ranked: families.setdefault(item[1]['instrument'].get('asset_class','unknown'),[]).append(item)
-                order=list(families)
-                if order:
-                    offset=(expected//300000)%len(order);order=order[offset:]+order[:offset]
-                    entry_results=[]
-                    while order and len(entry_results)<cfg.ai_shortlist:
-                        next_order=[]
-                        for family in order:
-                            if families[family] and len(entry_results)<cfg.ai_shortlist: entry_results.append(families[family].pop(0))
-                            if families[family]: next_order.append(family)
-                        order=next_order
             ready_held=[p for p in held if any(r[0]==p['symbol'] for r in valid)]
             cursor=self.store.get('last_managed_position_id',0)
             managed=next((p for p in ready_held if p['id']>cursor),ready_held[0] if ready_held else None)
+            entry_results=await self._prepare_entry_candidates(ranked,rows,cfg,expected,expanded)
             selected=[r[0] for r in entry_results]+([managed['symbol']] if managed else [])
             self.scan={'at':utcnow(),'rows':rows,'selected':list(dict.fromkeys(selected)),
                 'error':'Analyse indisponible pour '+', '.join(held_errors) if held_errors else None}
-            self.rules.update(await self.market.rules([r[0] for r in entry_results]))
-            # Scanner quotes can age while other markets finish. Refresh only
-            # the shortlist before asking the model about executable geometry.
-            refreshed=await asyncio.gather(*(self.market.quote(r[0]) for r in entry_results),return_exceptions=True)
-            ready_entries=[]
-            for item,q in zip(entry_results,refreshed):
-                symbol,data,setups=item
-                if isinstance(q,BaseException):
-                    for row in rows:
-                        if row['symbol']==symbol:row.update(status='INDISPONIBLE',reason='Cotation avant analyse IA indisponible : '+str(q)[:180])
-                    continue
-                self.quotes[symbol]=q;data['quote']=asdict(q)
-                data['structure']={side:structural_levels(data,entry=q.ask if side=='BUY' else q.bid,
-                    direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1) for side in data['directions']}
-                data['feasibility']={side:market_feasibility(data,q,self.rules[symbol],cfg,short=side=='SHORT') for side in data['directions']}
-                if data['feasibility']:
-                    for row in rows:
-                        if row['symbol']==symbol:
-                            row['feasibility']=data['feasibility']
-                            row['reason']+=' — '+' | '.join(side+' : '+bound['reason'] for side,bound in data['feasibility'].items())
-                ready_entries.append(item)
-            entry_results=ready_entries
-            self.scan['selected']=[r[0] for r in entry_results]+([managed['symbol']] if managed and managed['symbol'] not in [r[0] for r in entry_results] else [])
         except Exception as exc:
             self.scan['error']=str(exc)[:400]
             self.health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message=f'Analyse bloquée : {str(exc)[:400]}')
@@ -594,17 +650,20 @@ class TradingEngine:
                 'direction_candidates':{s:data['direction_candidates'] for s,data,_ in results},
                 'positions':[p for p in positions if not target or p['symbol']==target]}
             if target: context['managed_symbol']=target
+            if mode=='entry':context['entry_plans']=build_entry_plans(results,cfg)
             return context
         calls=[]
         if managed:
             results=[r for r in valid if r[0]==managed['symbol']]
             calls.append((context_for(results,'management',managed['symbol']),{r[0]:r[1] for r in results}))
-        entry_ready=(entry_results and any(r[2] for r in entry_results) and len(positions)<cfg.max_positions
+        entry_context=context_for(entry_results,'entry')
+        entry_ready=(entry_context['entry_plans'] and len(positions)<cfg.max_positions
             and available>0 and not base['entries_paused'] and self.health['market_ok'] and self.reconciled and not held_errors)
         if entry_ready:
-            calls.append((context_for(entry_results,'entry'),{r[0]:r[1] for r in entry_results}))
+            calls.append((entry_context,{r[0]:r[1] for r in entry_results}))
         if not calls:
             reason=('Aucune configuration admissible après scan ; aucun appel IA facturé.' if not ranked else
+                'Aucun plan de marché vérifiable ne respecte le ratio net et les niveaux requis ; aucun appel IA facturé.' if not entry_context['entry_plans'] else
                 'Nouvelles entrées suspendues : capacité, risque disponible, pause ou données insuffisantes.')
             self.store.decision(wait(reason),None,{'scanner':self.scan,'closed_candle_ms':expected,'portfolio':portfolio})
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
@@ -624,6 +683,11 @@ class TradingEngine:
             self.health.update(ai_ok=True,ai_error=None,ai_error_kind=None)
 
     async def _decide_and_execute(self,context,raw_markets,cfg,revision,expected,key,day):
+        if context.get('mode')=='entry' and int(time.time()*1000)-expected>=65000:
+            message='Fenêtre d’entrée expirée avant appel IA après clôture M5 (65 s).'
+            self.store.decision(wait(message),message,{'context':context,'closed_candle_ms':expected})
+            self.health['last_analysis_at']=self.store.get('last_analysis_at')
+            return {'error':None,'error_kind':None}
         reserve=sum(len(v.encode('utf-8')) for v in (dumps(context),SYSTEM_PROMPT,dumps(Decision.model_json_schema())))+MAX_OUTPUT_TOKENS+1000
         if not self.env.api_key and not getattr(self.ai,'test_enabled',False):
             result=await self.ai.decide(context)
@@ -655,6 +719,8 @@ class TradingEngine:
         try:
             if result.error:raise RiskRejected(result.error)
             validate_context(decision,context)
+            if entry and int(time.time()*1000)-expected>65000:
+                raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
             if decision.action in {'BUY','SHORT','SELL'}:
                 if decision.symbol not in context['markets']:raise RiskRejected('Marché absent de la sélection analysée.')
                 if entry:
@@ -690,7 +756,7 @@ class TradingEngine:
                     if q is None:raise RiskRejected('Cotation exécutable absente.')
                     self.quotes[decision.symbol]=q
                     detail['execution_quote']={'bid':q.bid,'ask':q.ask,'time_ms':q.time_ms}
-                    if entry and q.time_ms-expected>65000:raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
+                    if entry and int(time.time()*1000)-expected>65000:raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
                     if entry:
                         if decision.symbol.startswith('CAP:') and self.provider_setup:raise RiskRejected('Connexion de données en cours de modification.')
                         if decision.action not in context['directions'].get(decision.symbol,[]):raise RiskRejected('Direction non admissible selon le scanner.')
@@ -711,6 +777,11 @@ class TradingEngine:
                             atr=structure_context['m5']['atr14'],now_ms=int(time.time()*1000),structure_context=structure_context,
                             portfolio_positions=held,portfolio_quotes=self.quotes,risk_budget_pct=budget/max(stats['equity'],1e-12)*100)
                         detail['structure_context']={'m5':structure_context['m5'],'h1':structure_context['h1']}
+                        # The feed event can still be fresh while the local M5
+                        # entry deadline has elapsed. Recheck at the last instant
+                        # before booking an order, including time spent planning.
+                        if int(time.time()*1000)-expected>65000:
+                            raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
                         self.paper.buy(plan,q,f'{key}:{decision.symbol}',decision,cfg,{**detail,'plan':asdict(plan)})
                         opened=self.store.position(decision.symbol)
                         if opened:self._set_reconciliation(opened,True)
