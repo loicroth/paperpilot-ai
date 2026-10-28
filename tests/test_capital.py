@@ -46,7 +46,9 @@ def rig(monkeypatch):
             state['fail_once']=False;return httpx.Response(401,json={},headers={'Date':DATE})
         if path.endswith('/time'):body={'serverTime':NOW}
         elif '/markets/' in path:
-            body=json.loads(json.dumps(state['details']));body['instrument']['epic']=path.rsplit('/',1)[-1]
+            epic=path.rsplit('/',1)[-1]
+            body=json.loads(json.dumps(state.get('details_by_symbol',{}).get(epic,state['details'])))
+            body['instrument']['epic']=epic
         elif path.endswith('/markets'):body={'markets':state['rows']}
         elif '/prices/' in path:body=state.get('prices',{'prices':[]})
         else:body={}
@@ -145,6 +147,77 @@ async def test_balanced_catalog_and_closed_labels(rig):
     assert {r['asset_class'] for r in rows}=={'share_cfd','etf_cfd','index_cfd','forex_cfd','commodity_cfd'}
     assert 'CAP:FUTURE' not in [r['symbol'] for r in rows]
     assert next(r for r in rows if r['symbol']=='CAP:CLOSED')['reason']
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_replaces_unsupported_contracts_until_usable_slots_are_filled(rig):
+    c,state,requests,client=rig
+    state['rows']=[market(epic=s,instrumentType='INDICES',instrumentName=s)
+        for s in ['US500','US100','US30','VALID_NEXT']]
+    nonusd=details();nonusd['instrument']['currency']='EUR'
+    multiplier=details();multiplier['instrument']['lotSize']=10
+    state['details_by_symbol']={'US500':nonusd,'US100':multiplier}
+    rows=await c.catalog(2)
+    assert [r['symbol'] for r in rows if r['supported']]==['CAP:US30','CAP:VALID_NEXT']
+    blocked={r['symbol']:r['reason'] for r in rows if not r['supported']}
+    assert 'USD' in blocked['CAP:US500'] and 'Multiplicateur' in blocked['CAP:US100']
+    assert len([r for r in requests if '/markets/' in r.url.path])==4
+    assert c.metadata['CAP:US500']['supported'] is False
+    assert c.metadata['CAP:US30']['supported'] is True
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_replacements_preserve_family_balance_and_detail_cache(rig):
+    c,state,requests,client=rig
+    families=[('INDICES','US500','US100'),('SHARES','AAPL','MSFT'),
+        ('ETF','SPY','QQQ'),('CURRENCIES','EURUSD','GBPUSD'),('COMMODITIES','GOLD','SILVER')]
+    state['rows']=[];state['details_by_symbol']={}
+    for kind,bad,good in families:
+        for epic in (bad,good):
+            state['rows'].append(market(epic=epic,instrumentType=kind,instrumentName=epic))
+            row=details();row['instrument']['type']=kind
+            if epic==bad:row['instrument']['currency']='EUR'
+            state['details_by_symbol'][epic]=row
+    rows=await c.catalog(5)
+    usable=[r for r in rows if r['supported']]
+    assert len(usable)==5 and {r['asset_class'] for r in usable}=={
+        'index_cfd','share_cfd','etf_cfd','forex_cfd','commodity_cfd'}
+    assert {r['symbol'] for r in usable}=={'CAP:'+good for _,_,good in families}
+    assert len([r for r in rows if not r['supported']])==5
+    first_details=[r.url.path for r in requests if '/markets/' in r.url.path]
+    assert len(first_details)==10
+    # Refreshing the catalogue must not invalidate the existing 300s detail cache.
+    assert len([r for r in await c.catalog(5) if r['supported']])==5
+    assert [r.url.path for r in requests if '/markets/' in r.url.path]==first_details
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_unsupported_validation_budget_is_bounded(rig):
+    c,state,requests,client=rig
+    state['details']['instrument']['currency']='EUR'
+    state['rows']=[market(epic=f'UNSUPPORTED_{i:03}',instrumentType='INDICES') for i in range(50)]
+    rows=await c.catalog(3)
+    assert not any(r['supported'] for r in rows)
+    assert len(rows)==15
+    assert len([r for r in requests if '/markets/' in r.url.path])==15
+    assert all('USD' in r['reason'] for r in rows)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_closed_or_delayed_catalog_rows_are_diagnostic_without_detail_requests(rig):
+    c,state,requests,client=rig
+    state['rows']=[market(epic='CLOSED',marketStatus='CLOSED'),
+        market(epic='DELAYED',delayTime=15),market(epic='SILVER')]
+    rows=await c.catalog(3)
+    assert [r['symbol'] for r in rows if r['supported']]==['CAP:SILVER']
+    blocked={r['symbol']:r['reason'] for r in rows if not r['supported']}
+    assert 'fermé' in blocked['CAP:CLOSED'] and 'retardées' in blocked['CAP:DELAYED']
+    paths=[r.url.path.rsplit('/',1)[-1] for r in requests if '/markets/' in r.url.path]
+    assert paths==['SILVER']
     await client.aclose()
 
 
@@ -250,3 +323,4 @@ async def test_slow_metadata_does_not_block_quote_and_request_starts_stay_paced(
         finally:
             release_metadata.set()
             await metadata_task
+

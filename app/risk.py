@@ -26,6 +26,8 @@ class OrderPlan:
     maintenance_margin_pct: float = 50.
     structure_audit: dict = field(default_factory=dict)
     risk_pct_used: float = 0.
+    fee_rate: float | None = None
+    financing_source: str | None = None
 
 def D(v): return Decimal(str(v))
 def floor_step(value,step):
@@ -119,7 +121,9 @@ class RiskEngine:
         def rounded(price): return float((D(price)/D(tick)).to_integral_value(rounding=rounding)*D(tick))
         stop,target=rounded(decision.stop_loss),rounded(decision.take_profit)
         slip=settings.slippage_bps/10000
-        if not 0<=slip<=.01 or not 0<=settings.fee_rate<=.01: reject('Frais/glissement CFD invalides.')
+        fee_rate=getattr(settings,'cfd_fee_rate',0.)
+        if not isinstance(fee_rate,(int,float)) or not math.isfinite(fee_rate) or not 0<=slip<=.01 or not 0<=fee_rate<=.01:
+            reject('Frais/glissement CFD invalides.')
         entry=reference*(1-slip if short else 1+slip)
         distance=direction*(entry-stop)
         if distance<.35*atr or direction*(target-entry)<=0: reject('Stop CFD incompatible avec le bruit ATR ou objectif invalide.')
@@ -131,16 +135,24 @@ class RiskEngine:
         if not math.isfinite(margin_pct) or not 0<margin_pct<=100: reject('Marge fournisseur inconnue ou incompatible.')
         if not math.isfinite(requested) or not 1<=requested<=5: reject('Levier CFD limité de 1 à 5.')
         leverage=min(requested,100/margin_pct)
-        financing=max(getattr(settings,'cfd_financing_daily',.001),getattr(rules,'financing_daily',0))
+        provider_financing=getattr(rules,'financing_short_daily' if short else 'financing_long_daily',None)
+        if provider_financing is not None:
+            # A verified signed provider debit can be below the conservative
+            # configured fallback. Positive provider credits are already ignored.
+            financing=provider_financing
+            financing_source=getattr(rules,'financing_source',None) or 'provider_directional_daily_estimate'
+        else:
+            financing=max(getattr(settings,'cfd_financing_daily',.001),getattr(rules,'financing_daily',0))
+            financing_source='configured_daily_estimate'
         maintenance=getattr(rules,'maintenance_margin_pct',50.)
-        if not math.isfinite(financing) or not 0<=financing<=.05 or not math.isfinite(maintenance) or not 0<maintenance<=100:
+        if not isinstance(financing,(int,float)) or not math.isfinite(financing) or not 0<=financing<=.05 or not math.isfinite(maintenance) or not 0<maintenance<=100:
             reject('Financement ou marge de maintenance CFD invalide.')
         stop_fill=stop*(1+slip if short else 1-slip)
         target_fill=target*(1+slip if short else 1-slip)
-        fee_per_entry=entry*settings.fee_rate*fx_ask
+        fee_per_entry=entry*fee_rate*fx_ask
         carry=entry*financing*fx_ask # One-day reserve; execution exits after 24h at next tradeable quote.
-        loss=direction*(entry-stop_fill)*fx_ask+fee_per_entry+stop_fill*settings.fee_rate*fx_ask+carry
-        reward=direction*(target_fill-entry)*fx_bid-fee_per_entry-target_fill*settings.fee_rate*fx_ask-carry
+        loss=direction*(entry-stop_fill)*fx_ask+fee_per_entry+stop_fill*fee_rate*fx_ask+carry
+        reward=direction*(target_fill-entry)*fx_bid-fee_per_entry-target_fill*fee_rate*fx_ask-carry
         if loss<=0 or reward<=0 or reward/loss+1e-10<settings.min_rr: reject('Ratio CFD net insuffisant après frais et financement estimé.')
         margin_unit=entry*fx_ask/leverage
         filters=[rules.max_qty,rules.min_qty,rules.step_size,rules.min_notional,rules.max_notional]
@@ -157,7 +169,7 @@ class RiskEngine:
         return OrderPlan(decision.symbol,qty,entry,stop,target,fee,qty*loss,reward/loss,
             kind='cfd',direction='SHORT' if short else 'LONG',margin=margin,leverage=leverage,
             multiplier=1.,currency='USD',fx_open=fx_ask,financing_daily=financing,maintenance_margin_pct=maintenance,
-            structure_audit=structure,risk_pct_used=qty*loss/equity*100)
+            structure_audit=structure,risk_pct_used=qty*loss/equity*100,fee_rate=fee_rate,financing_source=financing_source)
 
 
 def cfd_fx(quote):
@@ -258,3 +270,4 @@ def remaining_position_risk(position,quote=None,now_ms=None):
 def portfolio_remaining_risk(positions,quotes=None,now_ms=None):
     quotes=quotes or {}
     return sum(remaining_position_risk(p,quotes.get(p['symbol']),now_ms) for p in positions)
+

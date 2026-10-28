@@ -4,6 +4,13 @@ from .storage import utcnow, dumps
 from .risk import cfd_fx
 
 log=logging.getLogger('paperpilot')
+CFD_FINANCING_METHOD='Estimation prorata du temps écoulé ; ne reproduit pas le rollover exact du courtier.'
+
+
+def _financing_source(position):
+    detail=position.get('detail') or {}
+    costs=detail.get('cfd_costs') or {};plan=detail.get('plan') or {}
+    return costs.get('financing_source') or plan.get('financing_source') or 'legacy_daily_estimate'
 
 class LiveExecutionEngine:
     """Intentionally unavailable: no signed request or API order endpoint exists in V1."""
@@ -27,6 +34,9 @@ class PaperExecutionEngine:
                 'exit':p.get('exit'),'net_pnl':p.get('net_pnl'),
                 'reason':p.get('exit_reason') if event=='CLOSE' else p.get('entry_reason'),
                 'structure_audit':structure}
+            if p.get('kind')=='cfd':
+                data.update(fee_rate=p.get('fee_rate'),financing_daily=p.get('financing_daily'),
+                    financing_source=_financing_source(p),financing_method=CFD_FINANCING_METHOD)
             log.info('PAPER_TRADE_AUDIT %s',json.dumps(data,ensure_ascii=False,allow_nan=False))
         except (KeyError,TypeError,ValueError,AttributeError):
             log.warning('PAPER_TRADE_AUDIT unavailable for a recorded trade')
@@ -133,6 +143,16 @@ class PaperExecutionEngine:
             raise ValueError('Plan CFD invalide.')
         if not 1<=plan.leverage<=5 or not math.isfinite(plan.entry_fee) or plan.entry_fee<0:
             raise ValueError('Levier ou frais CFD invalides.')
+        # New CFD plans carry their own commission. Legacy/manual plans retain
+        # the previous configured rate; existing persisted rows are never changed.
+        fee_rate=getattr(plan,'fee_rate',None)
+        if fee_rate is None:fee_rate=settings.fee_rate
+        if not isinstance(fee_rate,(int,float)) or not math.isfinite(fee_rate) or not 0<=fee_rate<=.01:
+            raise ValueError('Taux de commission CFD invalide.')
+        info=dict(detail or {})
+        info['cfd_costs']={'fee_rate':fee_rate,'financing_daily':plan.financing_daily,
+            'financing_source':getattr(plan,'financing_source',None) or 'legacy_daily_estimate',
+            'financing_method':CFD_FINANCING_METHOD}
         with self.store.transaction():
             if self.store.position(plan.symbol): raise ValueError('Une position est déjà ouverte sur ce marché.')
             if self.store.rows('SELECT id FROM trades WHERE signal=?',(signal,)): raise ValueError('Signal déjà exécuté.')
@@ -143,7 +163,7 @@ class PaperExecutionEngine:
                 kind,direction,margin,leverage,multiplier,currency,fx_open,financing_daily,financing_at,maintenance_margin_pct,last_bid,last_ask,last_fx_bid,last_fx_ask)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (plan.symbol,utcnow(),plan.entry,plan.quantity,plan.stop_loss,plan.take_profit,plan.entry_fee,plan.entry_fee,
-                plan.risk_usdt,decision.reason,dumps(detail),quote.time_ms,quote.bid,quote.ask,signal,settings.fee_rate,settings.slippage_bps,
+                plan.risk_usdt,decision.reason,dumps(info),quote.time_ms,quote.bid,quote.ask,signal,fee_rate,settings.slippage_bps,
                 'cfd',plan.direction,plan.margin,plan.leverage,1.,'USD',plan.fx_open,plan.financing_daily,now,plan.maintenance_margin_pct,quote.bid,quote.ask,fx_bid,fx_ask))
             self.store.set('cash',cash-cost)
             self.store.event(f'OUVERTURE CFD PAPER {plan.direction} {plan.symbol} : {plan.quantity:g} unités ; marge {plan.margin:.2f} USDT ; levier {plan.leverage:g}.')
@@ -170,7 +190,8 @@ class PaperExecutionEngine:
             net=gross-p['entry_fee']-fee-financing
             info=p['detail']; info['exit']=dict(detail or {})
             info['exit'].update(reason=reason,conversion_bid=fx_bid,conversion_ask=fx_ask,gross_pnl_usd=gross_usd,
-                financing_usdt=financing,financing_estimate=True)
+                financing_usdt=financing,financing_estimate=True,financing_source=_financing_source(p),
+                financing_method=CFD_FINANCING_METHOD)
             self.store.conn.execute("""UPDATE trades SET closed_at=?,exit=?,exit_fee=?,fees=?,net_pnl=?,exit_reason=?,
                 detail=?,exit_bid=?,exit_ask=?,last_market_at=?,financing_accrued=?,financing_at=? WHERE id=? AND closed_at IS NULL""",
                 (utcnow(),fill,fee,p['entry_fee']+fee,net,reason,dumps(info),quote.bid,quote.ask,quote.time_ms,
@@ -230,7 +251,10 @@ class PaperExecutionEngine:
 
 
 def cfd_financing(p,now_ms,fx_cost=None):
-    """Calendar carry estimate; accrued amount persists, so restarts never forgive financing."""
+    """Prorated calendar estimate, not the broker's discrete overnight rollover.
+
+    Accrued amounts persist so restarting cannot forgive recorded financing.
+    """
     since=p.get('financing_at',0)
     if not since: since=int(__import__('datetime').datetime.fromisoformat(p['opened_at']).timestamp()*1000)
     elapsed=max(0,now_ms-since)/86400000
@@ -254,7 +278,8 @@ def cfd_valuation(p,quote=None,now_ms=None):
     financing=cfd_financing(p,int(time.time()*1000) if now_ms is None else now_ms,fx_ask)
     return dict(current_price=market,valuation_stale=quote is None or not 0<=int(time.time()*1000)-quote.time_ms<=15000,
         valuation_at=getattr(quote,'time_ms',p.get('last_market_at')),financing_usdt=financing,unrealized_pnl=gross-fee-financing-p['entry_fee'],
-        equity_add=p['margin']+gross-fee-financing,margin_used=p['margin'],exit_fee_estimate=fee)
+        equity_add=p['margin']+gross-fee-financing,margin_used=p['margin'],exit_fee_estimate=fee,
+        financing_estimate=True,financing_source=_financing_source(p),financing_method=CFD_FINANCING_METHOD)
 
 
 
@@ -278,3 +303,4 @@ def portfolio_valuations(store,quotes):
                 valuation_at=q.time_ms if q else p.get('last_market_at'))
         positions.append(p)
     return positions
+

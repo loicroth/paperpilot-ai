@@ -1,3 +1,11 @@
+# Diagnostic des entrées et coûts CFD (28 octobre 2026)
+
+Le scanner distingue maintenant marchés vus, données réellement analysables, signaux techniques et faisabilité nette des candidats évalués. Chaque refus CFD indique le sens LONG/SHORT ou la donnée manquante. Les scans entièrement indisponibles restent enregistrés. Les journaux privés `PAPER_SCAN_AUDIT` et `PAPER_FEASIBILITY_AUDIT` rendent ces contrôles inspectables sans exposer les connexions.
+
+Le catalogue remplace les contrats incompatibles au lieu de leur laisser occuper une place. La commission CFD est séparée de la commission Spot : 0 % par défaut conformément à la [tarification Capital.com](https://capital.com/en-int/ways-to-trade/fees-and-charges). Le spread observé et le glissement configuré restent comptés. Les taux directionnels `instrument.overnightFee` de l'[API fournisseur](https://open-api.capital.com/) sont utilisés lorsqu'ils sont vérifiables ; sinon l'estimation de repli reste appliquée. Les crédits éventuels sont ignorés. La réserve d'un jour et la sortie après 24 h sont conservées. Le financement est une estimation prorata, pas une reproduction du calendrier exact des débits du courtier. Les frais des positions historiques restent ceux de leur ouverture.
+
+Les plafonds de risque et le ratio net minimal 2R ne sont pas abaissés pour obtenir des ordres. Une borne de faisabilité affichée n'est ni un ordre, ni une probabilité de gain.
+
 # Niveaux de marché et portefeuille multi-positions (26 octobre 2026)
 
 Les nouvelles entrées utilisent des stops justifiés par les pivots/supports/résistances M5/H1 et des objectifs avant le premier obstacle connu. Aucun objectif n'est construit pour fabriquer 2R : si les niveaux observés ne permettent pas le ratio net, l'entrée est refusée. Trois positions simultanées par défaut, risque habituel 1 %, maximum 1,4 % par trade et 2 % de risque cumulé aux stops. Les quantités diminuent lorsque le stop est plus éloigné. Le capital ou la marge par position est limité à une part du portefeuille (`equity / max_positions`) pour laisser des liquidités aux autres signaux. [Détails et limites](docs/STRUCTURE_PORTFOLIO.md).
@@ -93,3 +101,4 @@ Un VPS permanent est possible ultérieurement : **un seul processus**, dossier d
 - [Binance — filtres de trading](https://developers.binance.com/docs/binance-spot-api-docs/filters)
 - [OpenAI — Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 - [Architecture et garanties](docs/ARCHITECTURE.md)
+

@@ -25,6 +25,7 @@ class Settings(BaseModel):
     daily_loss_pct: float = Field(default=2.0, gt=0, le=2)
     min_rr: float = Field(default=2.0, ge=2, le=20)
     fee_rate: float = Field(default=.001, ge=.0001, le=.01)
+    cfd_fee_rate: float = Field(default=0., ge=0, le=.01)
     slippage_bps: float = Field(default=5, ge=0, le=100)
     max_spread_bps: float = Field(default=15, gt=0, le=100)
     max_atr_pct: float = Field(default=3, gt=0, le=10)
@@ -63,3 +64,4 @@ class Environment:
         if self.host not in {'127.0.0.1','localhost','::1'} and len(self.password)<16:
             raise ValueError('Accès réseau : définissez DASHBOARD_PASSWORD (16 caractères minimum), avec HTTPS devant le serveur.')
         if not 1024<=self.port<=65535: raise ValueError('PORT invalide (1024–65535).')
+

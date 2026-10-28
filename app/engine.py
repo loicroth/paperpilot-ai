@@ -5,13 +5,15 @@ from dataclasses import asdict
 from .config import Settings
 from .market import BinanceClient, MarketError
 from .multimarket import MultiMarket
-from .indicators import snapshot, candidates, short_candidates, long_refusals
+from .indicators import snapshot, candidates, short_candidates, long_refusals, short_refusals
 from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
 from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
 from .structure import structural_levels
 from .execution import PaperExecutionEngine
 from .metrics import statistics
 from .storage import utcnow, dumps
+from .scan_audit import scan_summary
+from .opportunity import market_feasibility
 
 log=logging.getLogger('paperpilot')
 
@@ -107,10 +109,13 @@ class TradingEngine:
         rows=self.store.rows('SELECT at,symbol,action,reason,rejection,detail FROM decisions WHERE at>=? ORDER BY id DESC',(since,))
         actions=Counter(row['action'] for row in rows)
         rejections=Counter(row['rejection'] for row in rows if row['rejection'])
-        selected=[]; orders=[]
+        selected=[]; orders=[]; last_scan=None
         for row in rows:
             try: detail=json.loads(row['detail']) if isinstance(row['detail'],str) else row['detail']
             except Exception: detail={}
+            saved_scan=detail.get('scanner') if isinstance(detail,dict) else None
+            if last_scan is None and isinstance(saved_scan,dict) and isinstance(saved_scan.get('rows'),list):
+                last_scan=scan_summary(saved_scan)
             if row['action'] in {'BUY','SHORT','SELL'} and len(orders)<40:
                 proposal=detail.get('proposal') if isinstance(detail,dict) else None
                 orders.append({'at':row['at'],'symbol':row['symbol'],'action':row['action'],
@@ -129,10 +134,15 @@ class TradingEngine:
             'rejections':dict(rejections.most_common(8)),'candidate_decisions':selected,
             'order_decisions':orders,
             'trade_count':self.store.rows('SELECT COUNT(*) AS n FROM trades WHERE opened_at>=?',(since,))[0]['n'],
-            'open_trade_count':len(self.store.positions()),
+            'open_trade_count':len(self.store.positions()),'last_scan':last_scan,
             'trades':self.store.rows('SELECT id,symbol,kind,direction,opened_at,closed_at,entry,exit,stop_loss,take_profit,quantity,risk_usdt,fees,financing_accrued,net_pnl,exit_reason FROM trades WHERE opened_at>=? ORDER BY id DESC LIMIT 20',(since,))}
         log.info('PAPER_HISTORY_REPORT %s',json.dumps(report,ensure_ascii=False))
+        if last_scan:log.info('PAPER_SCAN_AUDIT %s',json.dumps({'source':'persisted',**last_scan},ensure_ascii=False))
         return report
+    def scan_diagnostic(self):
+        summary=scan_summary(self.scan);self.scan['summary']=summary
+        log.info('PAPER_SCAN_AUDIT %s',json.dumps({'source':'current',**summary},ensure_ascii=False))
+        return summary
     def diagnostic(self):
         cfg=self.settings()
         provider=getattr(self.market,'capital',None)
@@ -145,6 +155,11 @@ class TradingEngine:
             'position_open':bool(self.store.positions()),'open_positions_count':len(self.store.positions()),
             'max_positions':cfg.max_positions,'max_trade_risk_pct':cfg.max_trade_risk_pct,
             'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct}
+        state['scanner_summary']=scan_summary(self.scan)
+        if hasattr(self.market,'status'):
+            source=self.market.status().get('capital',{})
+            state['cfd_source']={'connected':bool(source.get('connected')),'error':source.get('error'),
+                'supported':len(source.get('supported',[])),'blocked':len(source.get('blocked',[]))}
         log.info('PAPER_STATE %s',json.dumps(state,ensure_ascii=False))
         return state
     def day_state(self,equity,now=None):
@@ -414,26 +429,31 @@ class TradingEngine:
                 else:
                     m5,h1=await asyncio.gather(self.market.candles(symbol,'5m',150),self.market.candles(symbol,'1h',150))
                 if not m5 or m5[-1].close_time!=expected or (await self.market.server_time())-m5[-1].close_time>45000:
-                    raise MarketError('Bougie M5 absente ou trop ancienne pour une entrée.')
+                    raise MarketError(f"Bougie M5 absente ou trop ancienne pour une entrée (reçu={m5[-1].close_time if m5 else None}, attendu={expected}).")
                 if not h1 or h1[-1].close_time!=(now//3600000)*3600000-1:
-                    raise MarketError('Données H1 trop anciennes.')
+                    raise MarketError(f"Données H1 trop anciennes (reçu={h1[-1].close_time if h1 else None}, attendu={(now//3600000)*3600000-1}).")
                 a,b=snapshot(m5),snapshot(h1)
                 setups=candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
                 shorts=short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
                 spread=(quote.ask-quote.bid)/quote.bid*10000
                 if spread>cfg.max_spread_bps or a['atr_pct']>cfg.max_atr_pct:
                     setups=[];shorts=[]
+                cfd_reason=None
+                if symbol.startswith('CAP:') and not setups and not shorts:
+                    cfd_reason='LONG : '+' / '.join(long_refusals(a,b))
+                    cfd_reason+=(' | SHORT : '+' / '.join(short_refusals(a,b))) if cfg.allow_short else ' | SHORT désactivé'
                 data={'m5':a,'h1':b,'quote':asdict(quote),
                     'directions':(['BUY'] if setups else [])+(['SHORT'] if shorts else []),
                     'direction_candidates':{'BUY':setups,'SHORT':shorts},
                     'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'},
-                    'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else '; '.join(long_refusals(a,b)) if not symbol.startswith('CAP:') and not setups else None)}
+                    'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else cfd_reason if symbol.startswith('CAP:') else '; '.join(long_refusals(a,b)) if not setups else None)}
                 # Market references come first. Never derive an objective from a
                 # desired multiple and then ask the model to justify that price.
                 data['structure']={side:structural_levels(data,entry=quote.ask if side=='BUY' else quote.bid,
                     direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1)
                     for side in data['directions']}
                 return symbol,data,list(dict.fromkeys(setups+shorts))
+        rows=[]
         try:
             if cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
                 try:
@@ -473,6 +493,7 @@ class TradingEngine:
                 outstanding=[t for t in tasks.values() if not t.done()]
                 for task in outstanding: task.cancel()
                 await asyncio.gather(*outstanding,return_exceptions=True)
+            self.scan={'at':utcnow(),'rows':rows,'selected':[],'error':None}
             if not valid:
                 messages='; '.join(row['reason'] for row in rows[:3])
                 raise MarketError('Aucun marché analysable sur ce cycle. '+messages)
@@ -498,12 +519,35 @@ class TradingEngine:
             self.scan={'at':utcnow(),'rows':rows,'selected':list(dict.fromkeys(selected)),
                 'error':'Analyse indisponible pour '+', '.join(held_errors) if held_errors else None}
             self.rules.update(await self.market.rules([r[0] for r in entry_results]))
+            # Scanner quotes can age while other markets finish. Refresh only
+            # the shortlist before asking the model about executable geometry.
+            refreshed=await asyncio.gather(*(self.market.quote(r[0]) for r in entry_results),return_exceptions=True)
+            ready_entries=[]
+            for item,q in zip(entry_results,refreshed):
+                symbol,data,setups=item
+                if isinstance(q,BaseException):
+                    for row in rows:
+                        if row['symbol']==symbol:row.update(status='INDISPONIBLE',reason='Cotation avant analyse IA indisponible : '+str(q)[:180])
+                    continue
+                self.quotes[symbol]=q;data['quote']=asdict(q)
+                data['structure']={side:structural_levels(data,entry=q.ask if side=='BUY' else q.bid,
+                    direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1) for side in data['directions']}
+                data['feasibility']={side:market_feasibility(data,q,self.rules[symbol],cfg,short=side=='SHORT') for side in data['directions']}
+                if data['feasibility']:
+                    for row in rows:
+                        if row['symbol']==symbol:
+                            row['feasibility']=data['feasibility']
+                            row['reason']+=' — '+' | '.join(side+' : '+bound['reason'] for side,bound in data['feasibility'].items())
+                ready_entries.append(item)
+            entry_results=ready_entries
+            self.scan['selected']=[r[0] for r in entry_results]+([managed['symbol']] if managed and managed['symbol'] not in [r[0] for r in entry_results] else [])
         except Exception as exc:
             self.scan['error']=str(exc)[:400]
             self.health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message=f'Analyse bloquée : {str(exc)[:400]}')
             if self.store.claim_signal(key):
                 self.store.set('last_cycle',key)
-                self.store.decision(wait(self.health['message']),self.health['message'],{'closed_candle_ms':expected})
+                self.scan_diagnostic()
+                self.store.decision(wait(self.health['message']),self.health['message'],{'closed_candle_ms':expected,'scanner':self.scan})
                 self.health['last_analysis_at']=self.store.get('last_analysis_at')
                 self.store.event(self.health['message'],'error')
             return
@@ -512,6 +556,9 @@ class TradingEngine:
                 self.store.set('last_cycle',key);return
             self.store.set('last_cycle',key)
             if managed: self.store.set('last_managed_position_id',managed['id'])
+        self.scan_diagnostic()
+        bounds={symbol:data.get('feasibility',{}) for symbol,data,_ in entry_results if data.get('feasibility')}
+        if bounds:log.info('PAPER_FEASIBILITY_AUDIT %s',json.dumps({'at':utcnow(),'markets':bounds},ensure_ascii=False,allow_nan=False))
         stats,_=statistics(self.store,self.quotes);day=self.day_state(stats['equity'])
         positions=[{k:v for k,v in p.items() if k!='detail'} for p in stats['positions']]
         used=portfolio_remaining_risk(self.store.positions(),self.quotes,now_ms=int(time.time()*1000))
@@ -676,3 +723,4 @@ class TradingEngine:
                     'signal_id':key,'quote_age_ms':int(time.time()*1000)-reviewed.time_ms if reviewed else None},ensure_ascii=False))
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
         return outcome
+

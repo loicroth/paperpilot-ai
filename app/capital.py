@@ -193,18 +193,35 @@ class CapitalClient:
         def order(row):
             epic=row['epic'];priority=_PRIORITY.index(epic) if epic in _PRIORITY else len(_PRIORITY)
             return (row['reason'] is not None,priority,row['label'])
-        for rows in grouped.values():rows.sort(key=order)
-        selected=[];limit=max(1,min(int(limit),60))
-        while len(selected)<limit and any(grouped.values()):
-            for rows in grouped.values():
-                if rows and len(selected)<limit:selected.append(rows.pop(0))
-        for entry in selected:
-            try:
-                await self.rules([entry['symbol']])
-                entry['supported']=True
-            except MarketError as exc:
-                entry['supported']=False
-                entry['reason']=str(exc)
+        limit=max(1,min(int(limit),60))
+        # The limit counts usable contracts, not the first contracts inspected.
+        # Unsupported currencies/multipliers must not consume a scanner slot
+        # while compatible markets further down the catalogue remain unexamined.
+        # Keep the same family rotation and priorities, but bound expensive
+        # detail lookups when a provider catalogue contains many unsupported rows.
+        pending={};blocked=[]
+        for family,rows in grouped.items():
+            rows.sort(key=order)
+            pending[family]=[row for row in rows if row['reason'] is None]
+            blocked.extend(row for row in rows if row['reason'] is not None)
+        selected=[];supported=0;checked=0
+        check_budget=min(120,max(15,3*limit))
+        while supported<limit and checked<check_budget and any(pending.values()):
+            for rows in pending.values():
+                if not rows or supported>=limit or checked>=check_budget:continue
+                entry=rows.pop(0);checked+=1
+                try:
+                    await self.rules([entry['symbol']])
+                    entry['supported']=True
+                    supported+=1
+                except MarketError as exc:
+                    entry['supported']=False
+                    entry['reason']=str(exc)
+                selected.append(entry)
+        # Closed/delayed rows remain visible as blocked diagnostics, without
+        # spending metadata requests or crowding out currently tradable rows.
+        # The snapshot is intentionally bounded even for very large catalogues.
+        selected.extend(blocked[:limit])
         self.last_error=None
         return selected
 
@@ -258,6 +275,34 @@ class CapitalClient:
         if isinstance(result,MarketError):raise result
         return result
 
+    @staticmethod
+    def _financing_rates(instrument):
+        """Observed daily percentage adjustments, not an exact rollover model.
+
+        A negative provider rate is a debit; positive credits are deliberately
+        ignored. Missing or unverifiable intervals use the configured fallback.
+        """
+        result={'financing_long_daily':None,'financing_short_daily':None,'financing_source':None}
+        data=instrument.get('overnightFee')
+        if not isinstance(data,dict):return result
+        try:
+            timestamp=data['swapChargeTimestamp'];interval=data['swapChargeInterval']
+            if (isinstance(timestamp,bool) or isinstance(interval,bool)
+                or not math.isfinite(float(timestamp)) or not 1500000000000<=float(timestamp)<=4102444800000
+                or float(interval)!=1440):return result
+        except (KeyError,TypeError,ValueError,OverflowError):return result
+        for source,target in [('longRate','financing_long_daily'),('shortRate','financing_short_daily')]:
+            try:
+                value=data[source]
+                if isinstance(value,bool):continue
+                rate=float(value)
+                if not math.isfinite(rate):continue
+                result[target]=max(0.,-rate/100.)
+            except (KeyError,TypeError,ValueError,OverflowError):continue
+        if any(result[key] is not None for key in ('financing_long_daily','financing_short_daily')):
+            result['financing_source']='capital_api_overnight_daily_estimate'
+        return result
+
     async def rules(self,symbols):
         result={}
         for symbol in symbols:
@@ -287,7 +332,8 @@ class CapitalClient:
                 price_precision=10.**(-precision)
                 result[symbol]=Rules(symbol,values['minDealSize'],values['maxDealSize'],values['minSizeIncrement'],
                     0.,1e30,price_precision,provider='capital_demo',currency='USD',
-                    multiplier=1.,min_margin_pct=margin,asset_class=asset,allow_short=True)
+                    multiplier=1.,min_margin_pct=margin,asset_class=asset,allow_short=True,
+                    **self._financing_rates(instrument))
             except (KeyError,TypeError,ValueError,OverflowError):
                 raise MarketError('Contraintes CFD absentes ou non vérifiables : taille, précision ou marge manquante.') from None
         return result
@@ -330,3 +376,4 @@ class CapitalClient:
         if start_time is None and end_time is None and (not result or now-result[-1].close_time>duration+15000):
             raise MarketError('Dernière bougie CFD trop ancienne ; marché fermé ou données indisponibles.')
         return result
+

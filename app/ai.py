@@ -290,6 +290,7 @@ def validate_context(decision: Decision, context: dict) -> None:
             raise ValueError('Direction absente des configurations admissibles')
 
 SYSTEM_PROMPT = """Tu es le moteur d'analyse d'un robot de PAPER TRADING multi-marchés (crypto Spot Binance et CFD démo Capital.com). Tu ne peux exécuter aucun ordre.
+Pour les coûts, fee_rate concerne la crypto Spot ; cfd_fee_rate concerne les CFD. Les taux directionnels et leur source sont fournis dans feasibility.costs quand ils sont vérifiables. Ne transfère pas la commission Spot aux CFD. La borne feasibility décrit seulement les prix et coûts observés : elle ne prédit pas un gain et n'autorise aucune entrée. Pour WAIT, indique le motif concret (niveau manquant, ratio net insuffisant, structure non confirmée) plutôt qu'un risque générique.
 Renvoie UNE seule proposition JSON conforme au schéma de cet appel. Réponds en français. Respecte mode, managed_symbol et portfolio.
 Mode management : examine uniquement la position managed_symbol et son marché. Choisis HOLD pour la conserver ou SELL pour la clôturer si les faits observables justifient une sortie. Ne cherche aucune nouvelle entrée. SELL et HOLD utilisent entry, stop_loss, take_profit, invalidation et risk_pct null, setup none, confirmation_met false ; le plan existant n'est jamais déplacé.
 Mode entry : compare les marchés candidats pour UNE éventuelle nouvelle position, ou WAIT. Aucune vente ni gestion dans cet appel. N'ouvre jamais une nouvelle position sur un symbole déjà détenu ; respecte la capacité restante de portfolio et l'exposition déjà ouverte.
@@ -419,3 +420,4 @@ class AIClient:
             if stage == "output_json" and exc.args == ("Clé JSON dupliquée",):
                 return _failure("invalid_decision", stage, "duplicate_json_key", "Clé JSON dupliquée : décision ambiguë.", input_tokens, output_tokens)
             return _failure("invalid_decision", stage, "malformed_response", "Structure de réponse OpenAI inexploitable.", input_tokens, output_tokens)
+

@@ -16,7 +16,7 @@ SYMBOL='CAP:TEST'
 def cfg(**changes):
     base=Settings().model_dump()
     base.update(symbols=[SYMBOL],cfd_enabled=True,cfd_leverage=2.,cfd_financing_daily=.001,allow_short=True,
-        fee_rate=.001,slippage_bps=5.,max_spread_bps=30.,risk_pct=1.,min_rr=2.,max_atr_pct=3.)
+        fee_rate=.001,cfd_fee_rate=.001,slippage_bps=5.,max_spread_bps=30.,risk_pct=1.,min_rr=2.,max_atr_pct=3.)
     base.update(changes)
     return SimpleNamespace(**base)
 
@@ -214,3 +214,4 @@ def test_cfd_short_favorable_price_cannot_touch_or_cross_invalidation(offset):
 def test_cfd_zone_does_not_force_rr_after_financing_costs():
     with pytest.raises(RiskRejected,match='Ratio CFD net insuffisant'):
         cent_cfd_plan(reference=7.31,short=False,take_profit=7.65)
+

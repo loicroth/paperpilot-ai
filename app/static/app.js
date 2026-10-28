@@ -162,8 +162,10 @@
   }
   function renderScanner(scan, enabled) {
     scan=scan || {}; const rows=array(scan.rows), selected=array(scan.selected);
+    const counts=scan.summary, cfd=counts?.groups?.cfd;
+    const tally=counts?`${counts.valid} marchés analysables sur ${counts.total}${cfd?.seen?` · CFD : ${cfd.valid}/${cfd.seen} analysables, ${cfd.candidates} signaux`:''}`:`${rows.length} marchés examinés`;
     set('#scannerSummary', !enabled ? 'Liste manuelle active. Activez le scanner dans Paramètres pour élargir la recherche.' :
-      scan.error ? `Scan indisponible : ${scan.error}` : scan.at ? `${rows.length} marchés examinés · ${selected.length} retenus pour l’IA · ${time(scan.at)}` : 'Scanner activé : attend la prochaine clôture M5 après Démarrer.');
+      scan.error ? `Scan indisponible : ${scan.error}` : scan.at ? `${tally} · ${selected.length} retenus pour l’IA · ${time(scan.at)}` : 'Scanner activé : attend la prochaine clôture M5 après Démarrer.');
     smallTable('#scannerRows',['Marché','Famille','État','Motif'],rows.map(r=>[r.label || r.symbol,assetName(r.asset_class || (String(r.symbol || '').startsWith('CAP:')?'CFD':'crypto')),selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
   }
   function renderDecision(decisions) {
@@ -197,6 +199,7 @@
       const form = $('#settingsForm');
       for (const [key,value] of Object.entries(settings || {})) { const input = form.elements.namedItem(key); if (input) input.value = key === 'symbols' ? array(value).join(', ') : value; }
       if (n(settings.fee_rate) !== null) form.elements.fee_percent.value = Number((settings.fee_rate * 100).toFixed(5));
+      if (form.elements.cfd_fee_percent) form.elements.cfd_fee_percent.value = Number(((settings.cfd_fee_rate ?? 0) * 100).toFixed(5));
     }
     set('#usageCalls',`${num(usage.calls,0)} / ${num(usage.max_calls ?? settings.max_daily_calls,0)} appels`);
     set('#usageTokens',`${num(usage.tokens,0)} / ${num(usage.max_tokens ?? settings.max_daily_tokens,0)} tokens`);
@@ -251,6 +254,7 @@
     body.cfd_enabled=form.elements.cfd_enabled.value==='true';
     body.allow_short=form.elements.allow_short.value==='true';
     body.symbols=[...new Set(form.elements.symbols.value.toUpperCase().split(/[,;\s]+/).map(x=>x.replace('/','')).filter(Boolean))];body.model=form.elements.model.value.trim();body.fee_rate=Number(form.elements.fee_percent.value)/100;
+    body.cfd_fee_rate=Number(form.elements.cfd_fee_percent.value)/100;
     const ok=await mutate('/api/settings','PUT',body,'Paramètres enregistrés.');if(ok){dirtySettings=false;set('#settingsSaved','Enregistré');await refresh();}
   });
   $('#capitalForm').addEventListener('submit',async(event)=>{
@@ -274,3 +278,4 @@
   $('#confirmReset').addEventListener('click',async()=>{if($('#resetConfirmation').value!=='REINITIALISER'){notify('Saisissez exactement REINITIALISER pour confirmer.',true);return;}if(await mutate('/api/reset','POST',{confirmation:'REINITIALISER'},'Portefeuille réinitialisé à 900 USDT virtuels.'))$('#resetDialog').close();});
   showView(location.hash.slice(1));refresh();setInterval(refresh,5000);
 })();
+

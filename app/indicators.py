@@ -116,20 +116,28 @@ def candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
 
 def short_candidates(m5: dict, h1: dict, require_volume: bool = True) -> list[str]:
     """Mirror the exact LONG structural filters, solely for authorised CFDs."""
-    def mirror(data):
-        # Reflection about a positive anchor preserves EMA distances, ATR and volume.
-        anchor = 2 * max(data['recent_high'], data['resistance'], max(c['high'] for c in data['candles']), data['ema50'], data['ema21'])
-        def bar(c):
-            return {**c, 'open':anchor-c['open'], 'close':anchor-c['close'], 'high':anchor-c['low'], 'low':anchor-c['high']}
-        result = dict(data)
-        for key in ('ema9','ema21','ema50','ema21_previous','ema50_previous'):
-            result[key] = anchor-data[key]
-        for key in ('macd','macd_signal','macd_hist','macd_hist_previous'): result[key] = -data[key]
-        result.update(rsi14=100-data['rsi14'],support=anchor-data['resistance'],resistance=anchor-data['support'],
-            recent_low=anchor-data['recent_high'],recent_high=anchor-data['recent_low'],
-            last=bar(data['last']),previous=bar(data['previous']),candles=[bar(c) for c in data['candles']])
-        return result
-    return candidates(mirror(m5),mirror(h1),require_volume=require_volume)
+    return candidates(_mirror_snapshot(m5),_mirror_snapshot(h1),require_volume=require_volume)
+
+
+def _mirror_snapshot(data):
+    # Reflection preserves EMA distances, ATR and volume for SHORT diagnostics too.
+    anchor=2*max(data['recent_high'],data['resistance'],max(c['high'] for c in data['candles']),data['ema50'],data['ema21'])
+    def bar(c):return {**c,'open':anchor-c['open'],'close':anchor-c['close'],'high':anchor-c['low'],'low':anchor-c['high']}
+    result=dict(data)
+    for key in ('ema9','ema21','ema50','ema21_previous','ema50_previous'):result[key]=anchor-data[key]
+    for key in ('macd','macd_signal','macd_hist','macd_hist_previous'):result[key]=-data[key]
+    result.update(rsi14=100-data['rsi14'],support=anchor-data['resistance'],resistance=anchor-data['support'],
+        recent_low=anchor-data['recent_high'],recent_high=anchor-data['recent_low'],
+        last=bar(data['last']),previous=bar(data['previous']),candles=[bar(c) for c in data['candles']])
+    return result
+
+
+def short_refusals(m5,h1):
+    replacements={'RSI hors plage 40–76':'RSI hors plage 24–60','Bougie M5 non haussière':'Bougie M5 non baissière',
+        'H1 sous EMA21 : achat non autorisé':'H1 au-dessus EMA21 : vente non autorisée',
+        'EMA21 H1 descendante':'EMA21 H1 montante',
+        'Tendance H1 non confirmée : EMA21 sous EMA50':'Tendance H1 non confirmée : EMA21 au-dessus EMA50'}
+    return [replacements.get(reason,reason) for reason in long_refusals(_mirror_snapshot(m5),_mirror_snapshot(h1))]
 
 
 def long_refusals(m5: dict, h1: dict) -> list[str]:
@@ -144,3 +152,4 @@ def long_refusals(m5: dict, h1: dict) -> list[str]:
     if h1['ema21']<=h1['ema50']:reasons.append('Tendance H1 non confirmée : EMA21 sous EMA50')
     if not reasons:reasons.append('Cassure, retest, reprise ou retournement confirmé absent ; volume éventuellement insuffisant')
     return reasons
+

@@ -58,6 +58,9 @@ class Rules:
     allow_short: bool = False
     financing_daily: float = 0.0
     maintenance_margin_pct: float = 50.0
+    financing_long_daily: float | None = None
+    financing_short_daily: float | None = None
+    financing_source: str | None = None
 
 
 _INTERVALS = {"1s": 1000, "1m": 60000, "3m": 180000, "5m": 300000,
@@ -323,3 +326,4 @@ class BinanceClient:
             if not result or now - result[-1].close_time > duration + 15000:
                 raise MarketError("Dernière bougie Binance trop ancienne.")
         return result
+
