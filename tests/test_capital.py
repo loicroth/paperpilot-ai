@@ -319,6 +319,85 @@ async def test_closed_candles_and_conservative_m1_envelope(rig):
     await client.aclose()
 
 
+def candle_row(timestamp='2026-10-24T05:44:00'):
+    return {'snapshotTimeUTC':timestamp,'openPrice':{'bid':24.,'ask':24.02},
+        'closePrice':{'bid':24.01,'ask':24.03},'highPrice':{'bid':24.02,'ask':24.04},
+        'lowPrice':{'bid':23.98,'ask':24.},'lastTradedVolume':100.}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change,code,field',[
+    ('missing_time','CFD_CANDLE_TIME_MISSING','snapshotTimeUTC'),
+    ('invalid_time','CFD_CANDLE_TIME_INVALID','snapshotTimeUTC'),
+    ('missing_price','CFD_CANDLE_PRICE_MISSING','highPrice'),
+    ('price_type','CFD_CANDLE_PRICE_TYPE','lowPrice'),
+    ('missing_bid','CFD_CANDLE_PRICE_MISSING','closePrice.bid'),
+    ('invalid_ask','CFD_CANDLE_PRICE_INVALID','openPrice.ask'),
+    ('bid_ask_order','CFD_CANDLE_BID_ASK_ORDER','highPrice'),
+    ('volume','CFD_CANDLE_VOLUME_INVALID','lastTradedVolume'),
+    ('ohlc','CFD_CANDLE_OHLC_ENVELOPE','OHLC')])
+async def test_candle_refusals_identify_safe_code_interval_index_and_field(rig,change,code,field):
+    c,state,_,client=rig;row=candle_row()
+    if change=='missing_time':row.pop('snapshotTimeUTC')
+    if change=='invalid_time':row['snapshotTimeUTC']='do-not-log-provider-secret'
+    if change=='missing_price':row.pop('highPrice')
+    if change=='price_type':row['lowPrice']=['do-not-log-provider-secret']
+    if change=='missing_bid':row['closePrice'].pop('bid')
+    if change=='invalid_ask':row['openPrice']['ask']='do-not-log-provider-secret'
+    if change=='bid_ask_order':row['highPrice']['ask']=23.
+    if change=='volume':row['lastTradedVolume']='do-not-log-provider-secret'
+    if change=='ohlc':row['lowPrice']={'bid':25.,'ask':25.02}
+    state['prices']={'prices':[row]}
+    with pytest.raises(MarketError) as error:await c.candles('CAP:SILVER','1m')
+    message=str(error.value)
+    assert f'[{code}]' in message and 'interval=1m' in message
+    assert 'index=0' in message and f'champ={field}' in message
+    assert 'timestamp_ms=' in message
+    assert 'do-not-log' not in message and 'secret' not in message
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('prices,code',[
+    ({},'CFD_CANDLE_PRICES_MISSING'),({'prices':{}},'CFD_CANDLE_PRICES_TYPE'),
+    ({'prices':[None]},'CFD_CANDLE_ROW_TYPE'),({'prices':[]},'CFD_CANDLE_CLOSED_MISSING')])
+async def test_candle_response_shape_has_explicit_failure_code(rig,prices,code):
+    c,state,_,client=rig;state['prices']=prices
+    with pytest.raises(MarketError,match=code):await c.candles('CAP:SILVER','1m')
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_h1_alignment_refusal_exposes_actual_utc_timestamp_without_relaxing_it(rig):
+    c,state,_,client=rig
+    state['prices']={'prices':[candle_row('2026-10-24T04:30:00')]}
+    with pytest.raises(MarketError) as error:await c.candles('CAP:SILVER','1h')
+    message=str(error.value)
+    assert '[CFD_CANDLE_TIME_ALIGNMENT]' in message and 'interval=1h index=0' in message
+    assert 'timestamp_ms=1792816200000' in message
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_candles_have_chronology_code_while_natural_session_gaps_remain_allowed(rig):
+    c,state,_,client=rig
+    state['prices']={'prices':[candle_row('2026-10-24T05:42:00'),candle_row()]}
+    assert len(await c.candles('CAP:SILVER','1m'))==2
+    state['prices']['prices'].append(candle_row())
+    with pytest.raises(MarketError) as error:await c.candles('CAP:SILVER','1m')
+    assert '[CFD_CANDLE_CHRONOLOGY]' in str(error.value) and 'index=2' in str(error.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stale_candle_diagnostic_targets_last_closed_row_not_skipped_current_bar(rig):
+    c,state,_,client=rig
+    state['prices']={'prices':[candle_row('2026-10-24T05:40:00'),candle_row(TIME)]}
+    with pytest.raises(MarketError) as error:await c.candles('CAP:SILVER','1m')
+    assert '[CFD_CANDLE_LATEST_STALE]' in str(error.value) and 'index=0' in str(error.value)
+    await client.aclose()
+
+
 @pytest.mark.asyncio
 async def test_no_utc_time_no_freshness_substitution(rig):
     c,state,_,client=rig
@@ -407,9 +486,28 @@ async def test_slow_metadata_does_not_block_quote_and_request_starts_stay_paced(
             quote=await asyncio.wait_for(c.quote('CAP:SILVER'),timeout=.5)
             assert quote.symbol=='CAP:SILVER' and quote.bid==24.
             assert not metadata_task.done() and not release_metadata.is_set()
-            assert len(starts)==2 and starts[1][1]-starts[0][1]>=.26-1e-12
-            assert delays==pytest.approx([.26])
+            assert len(starts)==2 and starts[1][1]-starts[0][1]>=.13-1e-12
+            assert delays==pytest.approx([.13])
         finally:
             release_metadata.set()
             await metadata_task
+
+
+@pytest.mark.asyncio
+async def test_capital_concurrent_departures_stay_below_eight_per_second(monkeypatch):
+    clock={'now':100.};starts=[]
+    async def paced_sleep(delay):
+        clock['now']+=delay
+        await asyncio.sleep(0)
+    monkeypatch.setattr('app.capital.time',SimpleNamespace(monotonic=lambda:clock['now'],time=lambda:NOW/1000))
+    monkeypatch.setattr('app.capital.asyncio',SimpleNamespace(Lock=asyncio.Lock,sleep=paced_sleep))
+    async def handler(request):
+        starts.append(clock['now'])
+        return httpx.Response(200,json={'serverTime':NOW},headers={'Date':DATE})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        c=CapitalClient(client=client)
+        await asyncio.gather(*(c._get('/time') for _ in range(20)))
+    assert len(starts)==20
+    assert all(b-a>=.13-1e-12 for a,b in zip(starts,starts[1:]))
+    assert all(sum(start<=value<start+1.-1e-12 for value in starts)<=8 for start in starts)
 

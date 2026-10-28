@@ -92,7 +92,11 @@ class CapitalClient:
         if path=='/session': headers['X-CAP-API-KEY']=self.api_key
         try:
             async with self._request_lock:
-                delay=.26-(time.monotonic()-self._last_request)
+                # Official API limit: 10 requests/second/user
+                # https://open-api.capital.com/ (General information, limitations).
+                # Space departures below 8/s, leaving headroom for session work.
+                # POST /session retains its separate 1.05s authentication guard.
+                delay=.13-(time.monotonic()-self._last_request)
                 if delay>0: await asyncio.sleep(delay)
                 if time.monotonic()<self._blocked_until:
                     raise MarketError('Capital démo impose une pause ; nouvelle requête différée.')
@@ -376,33 +380,52 @@ class CapitalClient:
         for label,value in [('from',start_time),('to',end_time)]:
             if value is not None:params[label]=datetime.fromtimestamp(value/1000,timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
         data=await self._get('/prices/'+epic,params)
-        now=await self.server_time();result=[]
-        try:
-            rows=data['prices']
-            if not isinstance(rows,list):raise ValueError()
-            for row in rows:
-                opened=_timestamp(row['snapshotTimeUTC']);closed=opened+duration-1
-                if opened%duration!=0:raise ValueError()
-                if closed>=now:continue
-                if result and opened<=result[-1].close_time:raise ValueError()
-                def mid(key):
-                    p=row[key];bid,ask=_positive(p['bid']),_positive(p['ask'])
-                    if ask<bid:raise ValueError()
-                    return (bid+ask)/2
-                op,hi,lo,cl=[mid(k) for k in ['openPrice','highPrice','lowPrice','closePrice']]
-                if interval=='1m':
-                    # A conservative envelope cannot manufacture a favourable
-                    # fill when the bid/ask touched different exit levels.
-                    hi=max(_positive(row['highPrice']['bid']),_positive(row['highPrice']['ask']))
-                    lo=min(_positive(row['lowPrice']['bid']),_positive(row['lowPrice']['ask']))
-                volume_value=row.get('lastTradedVolume')
-                volume=_positive(volume_value,True) if volume_value is not None else 0.
-                if not lo<=min(op,cl)<=max(op,cl)<=hi:raise ValueError()
-                # Natural session gaps are retained; never invent missing candles.
-                result.append(Candle(opened,closed,op,hi,lo,cl,volume,volume_available=volume_value is not None))
-        except (KeyError,TypeError,ValueError,OverflowError):
-            raise MarketError('Bougies CFD invalides, incomplètes ou non chronologiques.') from None
-        if start_time is None and end_time is None and (not result or now-result[-1].close_time>duration+15000):
-            raise MarketError('Dernière bougie CFD trop ancienne ; marché fermé ou données indisponibles.')
+        now=await self.server_time();result=[];last_closed_index=None
+        def reject(code,field,index=None,opened=None):
+            # Only application-owned codes/field names and parsed UTC integers
+            # enter diagnostics. Never echo provider payloads or invalid strings.
+            raise MarketError(f'Bougies CFD refusées [{code}] interval={interval} index={index if index is not None else "-"} '
+                f'champ={field} timestamp_ms={opened if opened is not None else "-"}') from None
+        if 'prices' not in data:reject('CFD_CANDLE_PRICES_MISSING','prices')
+        rows=data['prices']
+        if not isinstance(rows,list):reject('CFD_CANDLE_PRICES_TYPE','prices')
+        for index,row in enumerate(rows):
+            if not isinstance(row,dict):reject('CFD_CANDLE_ROW_TYPE','prices',index)
+            if not row.get('snapshotTimeUTC'):reject('CFD_CANDLE_TIME_MISSING','snapshotTimeUTC',index)
+            try:opened=_timestamp(row['snapshotTimeUTC'])
+            except (TypeError,ValueError,OverflowError):reject('CFD_CANDLE_TIME_INVALID','snapshotTimeUTC',index)
+            closed=opened+duration-1
+            if opened%duration!=0:reject('CFD_CANDLE_TIME_ALIGNMENT','snapshotTimeUTC',index,opened)
+            if closed>=now:continue
+            if result and opened<=result[-1].close_time:reject('CFD_CANDLE_CHRONOLOGY','snapshotTimeUTC',index,opened)
+            sides={}
+            def mid(key):
+                if key not in row:reject('CFD_CANDLE_PRICE_MISSING',key,index,opened)
+                value=row[key]
+                if not isinstance(value,dict):reject('CFD_CANDLE_PRICE_TYPE',key,index,opened)
+                for side in ('bid','ask'):
+                    if side not in value:reject('CFD_CANDLE_PRICE_MISSING',key+'.'+side,index,opened)
+                    try:sides[(key,side)]=_positive(value[side])
+                    except (TypeError,ValueError,OverflowError):reject('CFD_CANDLE_PRICE_INVALID',key+'.'+side,index,opened)
+                bid,ask=sides[(key,'bid')],sides[(key,'ask')]
+                if ask<bid:reject('CFD_CANDLE_BID_ASK_ORDER',key,index,opened)
+                return (bid+ask)/2
+            op,hi,lo,cl=[mid(k) for k in ['openPrice','highPrice','lowPrice','closePrice']]
+            if interval=='1m':
+                # A conservative envelope cannot manufacture a favourable
+                # fill when the bid/ask touched different exit levels.
+                hi=max(sides[('highPrice','bid')],sides[('highPrice','ask')])
+                lo=min(sides[('lowPrice','bid')],sides[('lowPrice','ask')])
+            volume_value=row.get('lastTradedVolume')
+            try:volume=_positive(volume_value,True) if volume_value is not None else 0.
+            except (TypeError,ValueError,OverflowError):reject('CFD_CANDLE_VOLUME_INVALID','lastTradedVolume',index,opened)
+            if not lo<=min(op,cl)<=max(op,cl)<=hi:reject('CFD_CANDLE_OHLC_ENVELOPE','OHLC',index,opened)
+            # Natural session gaps are retained; never invent missing candles.
+            result.append(Candle(opened,closed,op,hi,lo,cl,volume,volume_available=volume_value is not None))
+            last_closed_index=index
+        if start_time is None and end_time is None:
+            if not result:reject('CFD_CANDLE_CLOSED_MISSING','prices')
+            if now-result[-1].close_time>duration+15000:
+                reject('CFD_CANDLE_LATEST_STALE','snapshotTimeUTC',last_closed_index,result[-1].open_time)
         return result
 
