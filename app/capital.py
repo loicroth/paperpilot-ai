@@ -232,7 +232,7 @@ class CapitalClient:
             self._details_at[symbol]=time.monotonic()
         return self._details[symbol]
 
-    async def _quote_row(self,symbol,row):
+    async def _quote_row(self,symbol,row,detail=None):
         try:
             if row.get('marketStatus')!='TRADEABLE':raise MarketError('Marché CFD fermé ou suspendu.')
             if row.get('delayTime')!=0:raise MarketError('Cotation CFD retardée ou délai non précisé.')
@@ -241,7 +241,8 @@ class CapitalClient:
             if not -1000<=broker_now-stamp<=15000:raise MarketError('Cotation CFD trop ancienne ou datée dans le futur.')
             bid,ask=_positive(row['bid']),_positive(row['offer'])
             if ask<bid or ask/bid>1.05:raise ValueError()
-            detail=await self._detail(symbol)
+            detail=await self._detail(symbol) if detail is None else detail
+            if detail['instrument'].get('epic')!=_epic(symbol):raise MarketError('Identité du contrat CFD différente de la cotation demandée.')
             if detail['instrument'].get('currency')!='USD':raise MarketError('Conversion de cette devise CFD non prise en charge.')
             # Preserve the observed event age across clock domains. A broker
             # clock offset must not make a valid quote appear future/stale to
@@ -256,16 +257,44 @@ class CapitalClient:
 
     async def quotes(self,symbols):
         """One actual batch snapshot for up to 50 epics, independently validated."""
-        if not 1<=len(symbols)<=50:raise MarketError('Lot de cotations CFD invalide.')
+        if not 1<=len(symbols)<=50 or len(set(symbols))!=len(symbols):
+            raise MarketError('Lot de cotations CFD invalide : 1 à 50 symboles uniques requis.')
         epics=[_epic(s) for s in symbols]
         data=await self._get('/markets',{'epics':','.join(epics)})
-        if not isinstance(data.get('markets'),list):raise MarketError('Lot de cotations CFD invalide.')
-        by_epic={r.get('epic'):r for r in data['markets'] if isinstance(r,dict)}
+        # Capital uses a different documented envelope for epics queries than
+        # for catalogue/searchTerm queries: nested instrument + snapshot rows.
+        if not isinstance(data.get('marketDetails'),list):
+            raise MarketError('Réponse CFD epics inattendue : tableau marketDetails requis.')
+        by_epic={};duplicates=set()
+        for row in data['marketDetails']:
+            if not isinstance(row,dict) or not isinstance(row.get('instrument'),dict):continue
+            epic=row['instrument'].get('epic')
+            if not isinstance(epic,str) or epic not in epics:continue
+            if epic in by_epic:duplicates.add(epic)
+            by_epic[epic]=row
         result={}
         for symbol,epic in zip(symbols,epics):
             try:
-                if epic not in by_epic:raise MarketError('Cotation CFD absente du lot.')
-                result[symbol]=await self._quote_row(symbol,by_epic[epic])
+                if epic in duplicates:raise MarketError('Contrat CFD dupliqué dans la réponse epics.')
+                if epic not in by_epic:raise MarketError('Contrat CFD demandé absent de marketDetails.')
+                detail=by_epic[epic];snapshot=detail.get('snapshot')
+                if not isinstance(snapshot,dict):raise MarketError('Détail CFD incomplet : snapshot requis.')
+                if isinstance(detail.get('dealingRules'),dict):
+                    self._details[symbol]=detail;self._details_at[symbol]=time.monotonic()
+                if snapshot.get('updateTimeUTC') is not None:
+                    result[symbol]=await self._quote_row(symbol,snapshot,detail)
+                else:
+                    # The documented snapshot only supplies updateTime, whose
+                    # timezone is unspecified. Never relabel it UTC or stamp a
+                    # cached snapshot as fresh. A documented search response
+                    # supplies its own bid/ask AND explicit updateTimeUTC.
+                    search=await self._get('/markets',{'searchTerm':epic})
+                    if not isinstance(search.get('markets'),list):
+                        raise MarketError('Réponse CFD searchTerm inattendue : tableau markets requis.')
+                    matches=[row for row in search['markets'] if isinstance(row,dict) and row.get('epic')==epic]
+                    if not matches:raise MarketError('Cotation CFD exacte absente de la recherche horodatée UTC.')
+                    if len(matches)!=1:raise MarketError('Cotation CFD exacte dupliquée dans la recherche UTC.')
+                    result[symbol]=await self._quote_row(symbol,matches[0],detail)
             except MarketError as exc:result[symbol]=exc
         return result
 

@@ -49,7 +49,7 @@ class MultiMarket:
             identifier=(os.getenv('CAPITAL_IDENTIFIER') or credentials.get('identifier','')),
             api_password=(os.getenv('CAPITAL_API_PASSWORD') or credentials.get('api_password','')))
         self.fx=fx or DollarConversion();self.catalog_rows=[];self.catalog_error=None
-        self.catalog_at=0.;self.catalog_limit=0;self.setup_lock=asyncio.Lock()
+        self.catalog_at=0.;self.catalog_limit=0;self.setup_lock=asyncio.Lock();self.catalog_lock=asyncio.Lock()
     def _load(self):
         p=self.credentials_path
         if not p or not p.exists(): return {}
@@ -98,8 +98,10 @@ class MultiMarket:
             return []
         try:
             if time.monotonic()-self.catalog_at>900 or limit!=self.catalog_limit:
-                self.catalog_rows=await self.capital.catalog(limit)
-                self.catalog_at=time.monotonic();self.catalog_limit=limit
+                async with self.catalog_lock:
+                    if time.monotonic()-self.catalog_at>900 or limit!=self.catalog_limit:
+                        self.catalog_rows=await self.capital.catalog(limit)
+                        self.catalog_at=time.monotonic();self.catalog_limit=limit
             self.catalog_error=None
             return [r['symbol'] for r in self.catalog_rows if r.get('supported') and r.get('market_status',r.get('status'))=='TRADEABLE'][:limit]
         except Exception as exc:
@@ -133,3 +135,4 @@ class MultiMarket:
         return await client.candles(symbol,*args,**kwargs)
     async def close(self):
         await asyncio.gather(self.binance.close(),self.capital.close(),self.fx.close())
+

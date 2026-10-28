@@ -27,7 +27,7 @@ class TradingEngine:
         self.scan = {'at': None, 'rows': [], 'selected': [], 'error': None}
         self._universe = []; self._universe_at = 0.; self._h1 = {}
         self.health=dict(status='DONNÉES INDISPONIBLES',message='Connexion aux données publiques…',market_ok=False,ai_ok=False,last_quote_at=None,last_analysis_at=store.get('last_analysis_at'))
-        self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None; self.verify_task=None
+        self.lock=asyncio.Lock(); self.task=None; self.analysis_task=None; self.verify_task=None; self.catalog_task=None
         self.started_ms=int(time.time()*1000); self.last_error=None; self.last_snapshot=0.; self.last_analysis_poll=0.; self.closing=False
         self.reconciled=False; self.provider_setup=False; self._settings_revision=0; self.critical_error=None
         self._position_reconciled={}
@@ -51,6 +51,14 @@ class TradingEngine:
     async def start(self):
         self.task=asyncio.create_task(self.run())
         if self.env.api_key: self.verify_task=asyncio.create_task(self.verify_ai())
+        if self.settings().cfd_enabled and hasattr(self.market,'cfd_symbols'):
+            self.catalog_task=asyncio.create_task(self._warm_cfd_catalog())
+    async def _warm_cfd_catalog(self):
+        try:
+            symbols=await self.market.cfd_symbols(self.settings().cfd_scan_limit)
+            log.info('PAPER_CFD_CATALOG %s',json.dumps({'ready':len(symbols)},ensure_ascii=False))
+        except asyncio.CancelledError:raise
+        except (MarketError,ValueError):log.warning('PAPER_CFD_CATALOG catalogue indisponible ; vérifier les motifs du scanner.')
     async def verify_ai(self):
         """One budgeted authentication/format check. Never a trading decision."""
         cfg=self.settings();day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -76,7 +84,7 @@ class TradingEngine:
         self.diagnostic()
     async def close(self):
         self.closing=True
-        tasks=[t for t in (self.verify_task,self.analysis_task,self.task) if t]+list(self._reconciliation_tasks.values())
+        tasks=[t for t in (self.verify_task,self.analysis_task,self.task,self.catalog_task) if t]+list(self._reconciliation_tasks.values())
         for task in tasks: task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
         self._reconciliation_tasks.clear();self._reconciliation_locks.clear()

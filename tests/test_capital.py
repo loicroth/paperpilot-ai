@@ -28,6 +28,14 @@ def market(**extra):
         'marketStatus':'TRADEABLE','delayTime':0,'updateTimeUTC':TIME,'bid':24.,'offer':24.02,**extra}
 
 
+def nested_market(epic='SILVER',**snapshot_changes):
+    row=details();row['instrument']['epic']=epic
+    row['snapshot'].update(market(epic=epic))
+    row['snapshot'].pop('epic')
+    row['snapshot'].update(snapshot_changes)
+    return row
+
+
 @pytest.fixture
 def rig(monkeypatch):
     captured=[]; state={'details':details(),'rows':[market()],'auths':0,'fail_auth':False,'fail_once':False}
@@ -49,7 +57,17 @@ def rig(monkeypatch):
             epic=path.rsplit('/',1)[-1]
             body=json.loads(json.dumps(state.get('details_by_symbol',{}).get(epic,state['details'])))
             body['instrument']['epic']=epic
-        elif path.endswith('/markets'):body={'markets':state['rows']}
+        elif path.endswith('/markets'):
+            if 'epics' in request.url.params:
+                nested=[]
+                for row in state['rows']:
+                    item=json.loads(json.dumps(state.get('details_by_symbol',{}).get(row['epic'],state['details'])))
+                    item['instrument']['epic']=row['epic']
+                    item['snapshot'].update({k:v for k,v in row.items() if k not in {'epic','updateTimeUTC'}})
+                    item['snapshot']['updateTime']=row.get('updateTimeUTC')
+                    nested.append(item)
+                body=state.get('epics_response',{'marketDetails':nested})
+            else:body=state.get('search_response',{'markets':state['rows']})
         elif '/prices/' in path:body=state.get('prices',{'prices':[]})
         else:body={}
         return httpx.Response(200,json=body,headers={'Date':DATE})
@@ -82,6 +100,72 @@ async def test_quote_preserves_exchange_event_age_on_local_clock_and_usd(rig):
     assert q.time_ms==NOW and q.bid==24 and q.ask==24.02 and q.currency=='USD'
     assert state['auths']==1
     assert requests[0].method=='POST' and json.loads(requests[0].content)['encryptedPassword'] is False
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_official_epics_envelope_uses_fresh_utc_search_not_ambiguous_snapshot_or_cached_price(rig):
+    c,state,requests,client=rig
+    snapshot=nested_market(updateTimeUTC=None,updateTime='2026-10-24T08:45:00',bid=999.,offer=999.02)
+    state['epics_response']={'marketDetails':[snapshot]}
+    q=await c.quote('CAP:SILVER')
+    assert (q.bid,q.ask,q.time_ms)==(24.,24.02,NOW)
+    assert [dict(r.url.params) for r in requests if r.url.path.endswith('/markets')]==[
+        {'epics':'SILVER'},{'searchTerm':'SILVER'}]
+    assert not any('/markets/' in r.url.path for r in requests)
+    # A subsequent price request still fetches observations; the metadata cache
+    # must not turn its old snapshot price into a new executable quote.
+    state['rows']=[market(bid=25.,offer=25.02)]
+    q=await c.quote('CAP:SILVER')
+    assert (q.bid,q.ask)==(25.,25.02)
+    assert len([r for r in requests if r.url.params.get('searchTerm')=='SILVER'])==2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_epics_snapshot_with_explicit_utc_is_validated_directly_and_warms_rules_cache(rig):
+    c,state,requests,client=rig
+    state['epics_response']={'marketDetails':[nested_market(bid=25.,offer=25.02)]}
+    q=await c.quote('CAP:SILVER')
+    assert (q.bid,q.ask,q.time_ms)==(25.,25.02,NOW)
+    assert (await c.rules(['CAP:SILVER']))['CAP:SILVER'].currency=='USD'
+    assert [dict(r.url.params) for r in requests if r.url.path.endswith('/markets')]==[{'epics':'SILVER'}]
+    assert not any('/markets/' in r.url.path for r in requests)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_epics_batch_failures_are_independent_and_duplicate_or_missing_contracts_never_quote(rig):
+    c,state,_,client=rig
+    state['epics_response']={'marketDetails':[nested_market(),nested_market('CLOSED',marketStatus='CLOSED'),
+        nested_market('DUPLICATE'),nested_market('DUPLICATE')]}
+    rows=await c.quotes(['CAP:SILVER','CAP:CLOSED','CAP:DUPLICATE','CAP:MISSING'])
+    assert rows['CAP:SILVER'].bid==24.
+    assert isinstance(rows['CAP:CLOSED'],MarketError) and 'fermé' in str(rows['CAP:CLOSED'])
+    assert isinstance(rows['CAP:DUPLICATE'],MarketError) and 'dupliqué' in str(rows['CAP:DUPLICATE'])
+    assert isinstance(rows['CAP:MISSING'],MarketError) and 'absent' in str(rows['CAP:MISSING'])
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('response',[{}, {'markets':[market()]}, {'marketDetails':{}}, {'marketDetails':None}])
+async def test_unknown_epics_envelope_is_refused_without_search_fallback(rig,response):
+    c,state,requests,client=rig;state['epics_response']=response
+    with pytest.raises(MarketError,match='marketDetails requis'):await c.quote('CAP:SILVER')
+    assert not any('searchTerm' in r.url.params for r in requests)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('response,message',[
+    ({'marketDetails':[]},'tableau markets requis'),
+    ({'markets':[market(epic='SILVER_OTHER')]},'exacte absente'),
+    ({'markets':[market(),market()]},'dupliquée'),
+    ({'markets':[market(updateTimeUTC=None,updateTime=TIME)]},'incomplète'),
+    ({'markets':[market(updateTimeUTC='2026-10-24T05:40:00')]},'trop ancienne')])
+async def test_utc_search_fallback_requires_exact_unique_fresh_explicit_utc_quote(rig,response,message):
+    c,state,_,client=rig;state['search_response']=response
+    with pytest.raises(MarketError,match=message):await c.quote('CAP:SILVER')
     await client.aclose()
 
 
@@ -280,7 +364,7 @@ async def test_metadata_lookup_cannot_refresh_quote_that_became_stale(rig,monkey
         return details()
     monkeypatch.setattr(c,'server_time',server_time)
     monkeypatch.setattr(c,'_detail',delayed_details)
-    with pytest.raises(MarketError,match='trop ancienne'):await c.quote('CAP:SILVER')
+    with pytest.raises(MarketError,match='trop ancienne'):await c._quote_row('CAP:SILVER',state['rows'][0])
     await client.aclose()
 
 
@@ -305,8 +389,13 @@ async def test_slow_metadata_does_not_block_quote_and_request_starts_stay_paced(
             body=details();body['instrument']['epic']='NVDA'
         else:
             assert request.url.path.endswith('/markets')
-            assert request.url.params['epics']=='SILVER'
-            body={'markets':[market()]}
+            if 'epics' in request.url.params:
+                assert request.url.params['epics']=='SILVER'
+                detail=details();detail['snapshot'].update(market())
+                body={'marketDetails':[detail]}
+            else:
+                assert request.url.params['searchTerm']=='SILVER'
+                body={'markets':[market()]}
         return httpx.Response(200,json=body,headers={'Date':DATE})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         c=CapitalClient('fixture-key','fixture-user','fixture-password',client=client)
