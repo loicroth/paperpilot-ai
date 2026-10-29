@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from app.ai import AIClient, decision_schema
+from app.ai import AIClient, decision_schema, ENTRY_SELECTION_PROMPT, SYSTEM_PROMPT, prompt_for
 
 
 def context(short=False):
@@ -29,6 +29,9 @@ def selection(ctx, identifier=None, risk_pct=None):
 async def decide(ctx, selected):
     def handler(request):
         payload = json.loads(request.content)
+        assert payload['instructions']==ENTRY_SELECTION_PROMPT
+        observed=json.loads(payload['input'][0]['content'][0]['text'])
+        assert observed['entry_plans']==ctx['entry_plans']
         schema = payload['text']['format']['schema']
         assert set(schema['required']) == {'choice', 'reason', 'confirmation', 'risks'}
         assert schema['additionalProperties'] is False
@@ -114,3 +117,11 @@ async def test_startup_diagnostic_checks_new_selection_format_with_wait_only():
     assert len(schema['properties']['choice']['anyOf']) == 1
     result = await decide(ctx, selection(ctx, 'WAIT'))
     assert result.error is None and result.decision.action == 'WAIT'
+
+
+def test_selection_and_legacy_price_generation_instructions_are_separate():
+    assert prompt_for(context())==ENTRY_SELECTION_PROMPT
+    assert 'Propose une invalidation structurelle' not in ENTRY_SELECTION_PROMPT
+    assert 'entry_plans' in ENTRY_SELECTION_PROMPT
+    assert prompt_for({'mode':'management'})==SYSTEM_PROMPT
+    assert prompt_for({})==SYSTEM_PROMPT
