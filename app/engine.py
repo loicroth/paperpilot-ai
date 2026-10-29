@@ -10,6 +10,7 @@ from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, vali
 from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
 from .structure import structural_levels
 from .entry_plans import build_entry_plans
+from .decision_audit import cfd_decision_record
 from .execution import PaperExecutionEngine
 from .metrics import statistics
 from .storage import utcnow, dumps
@@ -120,10 +121,13 @@ class TradingEngine:
         rows=self.store.rows('SELECT at,symbol,action,reason,rejection,detail FROM decisions WHERE at>=? ORDER BY id DESC',(since,))
         actions=Counter(row['action'] for row in rows)
         rejections=Counter(row['rejection'] for row in rows if row['rejection'])
-        selected=[]; orders=[]; last_scan=None
+        selected=[]; orders=[]; last_scan=None; cfd_decisions=[]
         for row in rows:
             try: detail=json.loads(row['detail']) if isinstance(row['detail'],str) else row['detail']
             except Exception: detail={}
+            if len(cfd_decisions)<24:
+                audit=cfd_decision_record(row,detail)
+                if audit:cfd_decisions.append(audit)
             saved_scan=detail.get('scanner') if isinstance(detail,dict) else None
             if last_scan is None and isinstance(saved_scan,dict) and isinstance(saved_scan.get('rows'),list):
                 last_scan=scan_summary(saved_scan)
@@ -148,6 +152,8 @@ class TradingEngine:
             'open_trade_count':len(self.store.positions()),'last_scan':last_scan,
             'trades':self.store.rows('SELECT id,symbol,kind,direction,opened_at,closed_at,entry,exit,stop_loss,take_profit,quantity,risk_usdt,fees,financing_accrued,net_pnl,exit_reason FROM trades WHERE opened_at>=? ORDER BY id DESC LIMIT 20',(since,))}
         log.info('PAPER_HISTORY_REPORT %s',json.dumps(report,ensure_ascii=False))
+        for audit in cfd_decisions:
+            log.info('PAPER_CFD_DECISION_HISTORY %s',json.dumps(audit,ensure_ascii=False))
         if last_scan:log.info('PAPER_SCAN_AUDIT %s',json.dumps({'source':'persisted',**last_scan},ensure_ascii=False))
         return report
     def scan_diagnostic(self):
@@ -795,6 +801,9 @@ class TradingEngine:
                     if not self.store.position(decision.symbol):raise RiskRejected('HOLD sans position : aucun ordre.')
             except (ValueError,MarketError) as exc:rejection=str(exc)
             self.store.decision(decision,rejection,detail)
+            audit=cfd_decision_record({'at':self.store.get('last_analysis_at'),
+                'symbol':decision.symbol,'action':decision.action,'reason':decision.reason,'rejection':rejection},detail)
+            if audit:log.info('PAPER_CFD_DECISION %s',json.dumps(audit,ensure_ascii=False))
             if decision.action in {'BUY','SHORT','SELL'}:
                 reviewed=self.quotes.get(decision.symbol)
                 log.info('PAPER_ORDER_REVIEW %s',json.dumps({'at':self.store.get('last_analysis_at'),
