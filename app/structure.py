@@ -53,6 +53,27 @@ def structural_levels(context, entry=None, direction='LONG', now_ms=None):
         if not math.isfinite(atr) or not math.isfinite(price) or atr<=0 or price<=0:raise ValueError()
     except (KeyError,TypeError,ValueError):
         raise StructureRejected('Prix ou ATR de structure indisponible.') from None
+    # The latest CLOSED M5 candle can confirm a retest before its low/high
+    # becomes a two-sided fractal. Keep the same geometric test as the scanner;
+    # this adds an observed stop reference, never removes a target obstacle.
+    bars=context['m5']['candles']
+    if len(bars)>=22:
+        previous,last=bars[-2:]
+        old_resistance=max(bar['high'] for bar in bars[-22:-2])
+        old_support=min(bar['low'] for bar in bars[-22:-2])
+        common={'timeframe':'M5','pivot_at':last['close_time'],
+            'confirmed_at':last['close_time'],'breakout_at':previous['close_time'],
+            'source':'retest clôturé après cassure'}
+        if (direction=='LONG' and previous['close']>old_resistance and
+            old_resistance-.5*atr<=last['low']<=old_resistance+.3*atr and
+            last['close']>old_resistance):
+            result['supports'].append({'price':float(min(old_resistance,last['low'])),
+                'broken_level':float(old_resistance),'observed_extreme':float(last['low']),**common})
+        if (direction=='SHORT' and previous['close']<old_support and
+            old_support-.3*atr<=last['high']<=old_support+.5*atr and
+            last['close']<old_support):
+            result['resistances'].append({'price':float(max(old_support,last['high'])),
+                'broken_level':float(old_support),'observed_extreme':float(last['high']),**common})
     for key in ('supports','resistances'):
         result[key].sort(key=lambda row:(row['price'],row['confirmed_at']))
     below=[r for r in result['supports'] if r['price']<price]
@@ -85,3 +106,4 @@ def validate_structural_plan(context,entry,stop,target,*,short=False,now_ms=None
         raise StructureRejected('Distance du stop extrême (>25 % du prix), même avec une référence structurelle.')
     levels.update(stop_loss=stop,take_profit=target,validated=True)
     return levels
+

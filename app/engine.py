@@ -627,6 +627,12 @@ class TradingEngine:
             self.store.set('last_cycle',key)
             if managed: self.store.set('last_managed_position_id',managed['id'])
         self.scan_diagnostic()
+        # Keep rejected candidates inspectable too. Previously only the final
+        # shortlist was logged, hiding the numerical cause of an empty list.
+        for row in rows:
+            if row.get('feasibility'):
+                log.info('PAPER_PLAN_REVIEW %s',json.dumps({'at':utcnow(),'symbol':row['symbol'],
+                    'bounds':row['feasibility']},ensure_ascii=False,allow_nan=False))
         bounds={symbol:data.get('feasibility',{}) for symbol,data,_ in entry_results if data.get('feasibility')}
         if bounds:log.info('PAPER_FEASIBILITY_AUDIT %s',json.dumps({'at':utcnow(),'markets':bounds},ensure_ascii=False,allow_nan=False))
         stats,_=statistics(self.store,self.quotes);day=self.day_state(stats['equity'])

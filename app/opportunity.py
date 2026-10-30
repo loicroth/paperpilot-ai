@@ -69,6 +69,10 @@ def market_feasibility(data, quote, rules, settings, short=False):
         anchor, obstacle, atr = levels['stop_reference'], levels['target_obstacle'], levels['atr']
         if anchor is None:
             return finish('missing_stop', 'Aucun pivot connu pour justifier un stop structurel.')
+        reference_fields=('price','timeframe','source','pivot_at','confirmed_at','broken_level','observed_extreme')
+        result['stop_reference']={key:anchor[key] for key in reference_fields if key in anchor}
+        if obstacle is not None:
+            result['target_obstacle']={key:obstacle[key] for key in reference_fields if key in obstacle}
         rounding = ROUND_UP if short else ROUND_DOWN
 
         tick = D(rules.tick_size)
