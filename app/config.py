@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from typing import Literal
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ class Settings(BaseModel):
     auto_scanner: bool = Field(default_factory=lambda: os.getenv('AUTO_SCANNER', 'false').lower() == 'true')
     scanner_limit: int = Field(default=30, ge=3, le=40)
     ai_shortlist: int = Field(default=4, ge=1, le=6)
+    strategy_profile: Literal['classic','expanded_v1'] = 'expanded_v1'
     cfd_enabled: bool = False
     cfd_leverage: float = Field(default=2, ge=1, le=5)
     allow_short: bool = True

@@ -20,7 +20,7 @@ Les décisions et erreurs sont conservées pour inspection. L'interface affiche 
 - Un signal M5 consommé ne peut pas créer deux achats après rafraîchissement ou redémarrage.
 - Le statut « ACTIVE » décrit l'état opérationnel ; il ne prédit pas une performance.
 - Le risque habituel est de 1 %, plafonné à 1,4 % par trade et à 2 % cumulé par défaut. Ces budgets correspondent aux pertes estimées avec les hypothèses d'exécution ; les gaps ou interruptions peuvent les dépasser.
-- Les niveaux M5/H1 sont extraits indépendamment du modèle. Le stop dépasse une référence structurelle avec une marge ATR ; l'objectif reste avant le premier obstacle connu. Une impossibilité d'atteindre 2R net produit un refus, sans modification des niveaux.
+- Les niveaux sont extraits indépendamment du modèle. Le classique conserve le premier obstacle M5/H1. Le setup pullback du profil expanded_v1 protège sa zone M5 exacte et vise le premier obstacle H1, avec les niveaux M5 intermédiaires visibles pour l'analyse. Chaque setup possède sa borne économique ; aucune borne d'un autre setup n'est empruntée. Une impossibilité d'atteindre 2R net produit un refus, sans modification d'objectif pour fabriquer le ratio. Voir STRATEGY_PROFILE.md.
 - Le risque cumulé est mesuré du cours observé jusqu'aux stops, sans compenser les pertes possibles par des gains latents. Des données de position absentes ou périmées bloquent les nouvelles entrées.
 - La migration SQLite v3 sauvegarde la base existante puis remplace l'unicité globale par une unicité du symbole ouvert. Les anciennes positions et leur historique sont conservés.
 - La perte quotidienne utilise le portefeuille de début de journée UTC ; un dépassement suspend les entrées jusqu'au jour suivant.

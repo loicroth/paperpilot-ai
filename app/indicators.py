@@ -153,3 +153,99 @@ def long_refusals(m5: dict, h1: dict) -> list[str]:
     if not reasons:reasons.append('Cassure, retest, reprise ou retournement confirmé absent ; volume éventuellement insuffisant')
     return reasons
 
+
+def pullback_reference(m5: dict, h1: dict, *, short: bool = False,
+                       require_volume: bool = True, now_ms: int | None = None) -> dict | None:
+    """Observe a closed trend-pullback reference; never propose a target or order.
+
+    The contact zone uses EMA21_previous, known before the signal candle.
+    Contacts and a real retracement must occur in its three preceding candles;
+    the stop reference covers six candles including the signal's own wick.
+    SHORT is the price-reflected LONG rule, with the original ATR percentage.
+    """
+    import time
+    try:
+        now_ms = int(time.time()*1000) if now_ms is None else now_ms
+        if type(now_ms) is not int or now_ms < 0 or type(short) is not bool or type(require_volume) is not bool:
+            return None
+
+        def finite(value):
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+        def closed_rows(data, minimum):
+            if not isinstance(data, dict) or not isinstance(data.get('candles'), list):
+                return None
+            rows = data['candles']
+            if len(rows) < minimum:
+                return None
+            end = -1
+            for bar in rows:
+                start, stop = bar['open_time'], bar['close_time']
+                op, high, low, close, volume = (bar[key] for key in ('open', 'high', 'low', 'close', 'volume'))
+                if (type(start) is not int or type(stop) is not int or
+                    not end < start <= stop <= now_ms or
+                    not all(finite(v) for v in (op, high, low, close, volume)) or
+                    not 0 < low <= min(op, close) <= max(op, close) <= high or volume < 0):
+                    return None
+                end = stop
+            if data.get('last') != rows[-1] or minimum >= 6 and data.get('previous') != rows[-2]:
+                return None
+            return rows
+
+        rows, hourly = closed_rows(m5, 6), closed_rows(h1, 2)
+        if rows is None or hourly is None or hourly[-1]['close_time'] > rows[-1]['close_time']:
+            return None
+        m5_keys = ('ema9', 'ema21', 'ema21_previous', 'atr14', 'atr_pct',
+                   'macd_hist', 'macd_hist_previous', 'rsi14', 'volume_ratio')
+        h1_keys = ('ema21', 'ema50', 'ema21_previous')
+        if not all(finite(m5[key]) for key in m5_keys) or not all(finite(h1[key]) for key in h1_keys):
+            return None
+        if min(m5['ema9'], m5['ema21'], m5['ema21_previous'],
+               h1['ema21'], h1['ema50'], h1['ema21_previous']) <= 0:
+            return None
+        original_rows = rows
+        reflection = None
+        if short:
+            def reflect(bar, anchor):
+                return dict(bar, open=anchor-bar['open'], close=anchor-bar['close'],
+                            high=anchor-bar['low'], low=anchor-bar['high'])
+            reflection = 2*max(max(bar['high'] for bar in rows), *(m5[key] for key in m5_keys[:3]))
+            hourly_reflection = 2*max(max(bar['high'] for bar in hourly), *(h1[key] for key in h1_keys))
+            if not finite(reflection) or not finite(hourly_reflection):
+                return None
+            rows = [reflect(bar, reflection) for bar in rows]
+            hourly = [reflect(bar, hourly_reflection) for bar in hourly]
+            m5 = dict(m5, **{key: reflection-m5[key] for key in m5_keys[:3]},
+                      macd_hist=-m5['macd_hist'], macd_hist_previous=-m5['macd_hist_previous'],
+                      rsi14=100-m5['rsi14'])
+            h1 = dict(h1, **{key: hourly_reflection-h1[key] for key in h1_keys})
+        last, previous = rows[-1], rows[-2]
+        atr = m5['atr14']
+        if atr <= 0 or not .03 <= m5['atr_pct'] <= 3 or not 40 <= m5['rsi14'] <= 76:
+            return None
+        if (last['high']-last['low'] > 2.5*atr or last['close']-m5['ema21'] > 2.5*atr or
+            last['close'] <= last['open'] or
+            last['close'] <= max(previous['high'], m5['ema9'], m5['ema21']) or
+            m5['macd_hist'] <= m5['macd_hist_previous']):
+            return None
+        if not (hourly[-1]['close'] > h1['ema21'] > h1['ema50'] and h1['ema21'] > h1['ema21_previous']):
+            return None
+        if not ((not require_volume and not m5.get('volume_available', True)) or m5['volume_ratio'] >= .8):
+            return None
+        prior = rows[-4:-1]
+        contacts = [bar for bar in prior if m5['ema21_previous']-.5*atr <= bar['low'] <= m5['ema21_previous']+.3*atr]
+        retraced = any(rows[i]['close'] < rows[i]['open'] or rows[i]['close'] < rows[i-1]['close']
+                       for i in range(len(rows)-4, len(rows)-1))
+        if not contacts or not retraced:
+            return None
+        pivot = min(rows[-6:], key=lambda bar: (bar['low'], -bar['close_time']))
+        price = (next(bar['high'] for bar in original_rows if bar['close_time'] == pivot['close_time'])
+                 if short else pivot['low'])
+        if not finite(price) or price <= 0:
+            return None
+        return dict(price=price, source='reprise clôturée après pullback', timeframe='M5',
+                    pivot_at=pivot['close_time'], confirmed_at=last['close_time'],
+                    zone_start_at=original_rows[-6]['open_time'], contact_at=contacts[-1]['close_time'])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+

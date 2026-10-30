@@ -7,7 +7,7 @@ from .risk import D, cfd_fx
 from .structure import structural_levels, validate_structural_plan
 
 
-def market_feasibility(data, quote, rules, settings, short=False):
+def market_feasibility(data, quote, rules, settings, short=False, setup=None):
     """Best net RR at the current quote, conservative ticks and known obstacles.
 
     Uses the tightest structurally valid stop, including the 0.35 ATR noise
@@ -65,14 +65,19 @@ def market_feasibility(data, quote, rules, settings, short=False):
                                financing_daily=financing, financing_source=source,
                                financing_reserve_days=1 if cfd else 0,
                                conversion_bid=fx_bid, conversion_ask=fx_ask)
-        levels = structural_levels(data, entry, 'SHORT' if short else 'LONG', now_ms=now)
+        market_reference=(quote.ask if short else quote.bid) if setup=='pullback' else None
+        levels = structural_levels(data, entry, 'SHORT' if short else 'LONG', now_ms=now, setup=setup, reference_price=market_reference)
         anchor, obstacle, atr = levels['stop_reference'], levels['target_obstacle'], levels['atr']
         if anchor is None:
             return finish('missing_stop', 'Aucun pivot connu pour justifier un stop structurel.')
-        reference_fields=('price','timeframe','source','pivot_at','confirmed_at','broken_level','observed_extreme')
+        reference_fields=('price','timeframe','source','pivot_at','confirmed_at','broken_level','observed_extreme','zone_start_at','contact_at')
         result['stop_reference']={key:anchor[key] for key in reference_fields if key in anchor}
         if obstacle is not None:
             result['target_obstacle']={key:obstacle[key] for key in reference_fields if key in obstacle}
+        if setup=='pullback':
+            result['target_basis']=levels.get('target_basis')
+            result['minor_obstacles']=[{key:r[key] for key in reference_fields if key in r}
+                for r in levels.get('minor_obstacles',[])[:8]]
         rounding = ROUND_UP if short else ROUND_DOWN
 
         tick = D(rules.tick_size)
@@ -111,7 +116,7 @@ def market_feasibility(data, quote, rules, settings, short=False):
         if stop <= 0 or target <= 0 or sign * (entry - stop) <= 0 or sign * (target - entry) <= 0:
             return finish('invalid_levels', 'Marge insuffisante avant le premier obstacle connu après arrondi.')
         try:
-            validate_structural_plan(data, entry, stop, target, short=short, now_ms=now)
+            validate_structural_plan(data, entry, stop, target, short=short, now_ms=now, setup=setup, reference_price=market_reference)
         except ValueError:
             return finish('invalid_levels', 'Aucun couple de niveaux valide avec les pivots et la précision du contrat.')
         stop_fill = stop * (1 + slip if short else 1 - slip)

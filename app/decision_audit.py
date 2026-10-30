@@ -19,7 +19,9 @@ def cfd_decision_record(row, detail):
     fields=('open_count','max_positions','risk_known','risk_used_usdt','risk_available_usdt',
             'max_trade_risk_pct','max_portfolio_risk_pct')
     safe_portfolio={k:v for k in fields if isinstance((v:=portfolio.get(k)),(int,float,bool)) or v is None}
+    rules=context.get('rules') or {}
     return {'at':str(row.get('at') or '')[:50],'mode':context.get('mode'),
+            'strategy_profile':rules.get('strategy_profile') if isinstance(rules,dict) else None,
             'action':str(row.get('action') or '')[:12],'symbol':str(row.get('symbol') or '')[:80],
             'reason':str(row.get('reason') or '')[:1400],
             'rejection':str(row['rejection'])[:500] if row.get('rejection') else None,

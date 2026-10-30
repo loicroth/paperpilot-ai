@@ -198,6 +198,7 @@
     if (!dirtySettings) {
       const form = $('#settingsForm');
       for (const [key,value] of Object.entries(settings || {})) { const input = form.elements.namedItem(key); if (input) input.value = key === 'symbols' ? array(value).join(', ') : value; }
+      form.elements.strategy_profile.value = settings.strategy_profile ?? 'expanded_v1';
       if (n(settings.fee_rate) !== null) form.elements.fee_percent.value = Number((settings.fee_rate * 100).toFixed(5));
       if (form.elements.cfd_fee_percent) form.elements.cfd_fee_percent.value = Number(((settings.cfd_fee_rate ?? 0) * 100).toFixed(5));
     }
@@ -251,6 +252,7 @@
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
     const body={};for(const key of ['risk_pct','max_trade_risk_pct','max_portfolio_risk_pct','max_positions','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
     body.auto_scanner=form.elements.auto_scanner.value==='true';
+    body.strategy_profile=form.elements.strategy_profile.value;
     body.cfd_enabled=form.elements.cfd_enabled.value==='true';
     body.allow_short=form.elements.allow_short.value==='true';
     body.symbols=[...new Set(form.elements.symbols.value.toUpperCase().split(/[,;\s]+/).map(x=>x.replace('/','')).filter(Boolean))];body.model=form.elements.model.value.trim();body.fee_rate=Number(form.elements.fee_percent.value)/100;

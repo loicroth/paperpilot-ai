@@ -21,7 +21,7 @@ class Decision(BaseModel):
     invalidation: float | None
     confirmation: str = Field(min_length=1, max_length=1000)
     risks: list[str] = Field(max_length=10)
-    setup: Literal["breakout", "retest", "consolidation", "reversal", "none"]
+    setup: Literal["breakout", "retest", "consolidation", "reversal", "pullback", "none"]
     confirmation_met: bool
     risk_pct: float | None = Field(default=None, gt=0, le=1.4)
 
@@ -379,6 +379,7 @@ Le champ reason contient une justification synthétique observable, pas un raiso
 
 ENTRY_SELECTION_PROMPT = """Tu sélectionnes une éventuelle nouvelle position de PAPER TRADING. Tu n'exécutes aucun ordre. Réponds en français avec uniquement choice, reason, confirmation et risks selon le schéma.
 Le catalogue entry_plans contient les plans proposés. Chaque objet fournit id, symbol, action, setup, entry, stop_loss, take_profit et invalidation. Ces prix sont déjà présents dans les données d'entrée, même s'ils ne figurent pas dans ton schéma de réponse. Tu choisis un identifiant ; le moteur recopiera les niveaux de cet objet et les contrôlera sur une nouvelle cotation. Ne génère aucun nouveau prix et ne réclame pas les champs de l'ancien format de réponse BUY/SHORT.
+Le setup pullback désigne une reprise clôturée après un repli récent vers l'EMA21, dans une tendance H1 alignée. Son stop protège toute la zone observée du repli et la mèche du signal ; son objectif reste avant le premier niveau H1 opposé connu. Les niveaux M5 intermédiaires restent fournis dans minor_obstacles pour ton analyse ; cette stratégie ne les utilise pas tous comme plafonds automatiques d'objectif. Cette configuration n'exige pas une nouvelle cassure du plus haut des vingt barres : l'absence de cette cassure seule ne la contredit pas. Ne remplace pas l'objectif H1 fourni par un objectif M5 supposé obligatoire.
 Les plans ont passé les filtres techniques déterministes et la borne de faisabilité structurelle nette au cours observé. Cela n'autorise pas encore un ordre : le moteur final vérifiera solde, précision, fraîcheur et risque. Analyse les faits M5/H1, le plan, les coûts et le portefeuille fournis pour choisir un plan ou WAIT. Tu peux écarter un plan si les observations fournies contredisent sa thèse ; indique alors le fait observable précis et le symbole concerné. N'invente pas une donnée absente ou une contradiction.
 Les niveaux de référence sont dans entry_plans. Si feasibility indique un ratio compatible et des niveaux complets, ne les décris pas comme manquants ou insuffisants en ignorant ces objets. Une confirmation déterministe déjà fournie n'est pas une condition future à attendre de nouveau. Les risques normaux et l'absence de garantie de gain ne suffisent pas à conclure que les données sont absentes. Aucun gain n'est garanti.
 choice.id est l'identifiant exact d'un plan fourni ou WAIT. WAIT reste autorisé si aucun plan n'est justifié par les observations ; explique le motif concret. Si le catalogue est vide, choisis WAIT. Pour un diagnostic_only, seul WAIT est autorisé et aucun marché n'est à négocier.

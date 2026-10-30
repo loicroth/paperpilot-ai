@@ -63,7 +63,8 @@ class RiskEngine:
         target=floor_step(decision.take_profit,rules.tick_size)
         if not 0<stop<entry<target: reject('Stop/objectif invalides après arrondi Binance.')
         if entry-stop<atr*.35: reject('Stop trop proche du bruit de marché (0,35 ATR minimum).')
-        try: structure=validate_structural_plan(structure_context,entry,stop,target,now_ms=now_ms)
+        try: structure=validate_structural_plan(structure_context,entry,stop,target,now_ms=now_ms,setup=decision.setup,
+            reference_price=quote.bid if decision.setup=='pullback' else None)
         except StructureRejected as exc: reject(str(exc))
         risk_pct=trade_risk_pct(decision,settings,equity,positions,portfolio_quotes,now_ms,risk_budget_pct)
         loss=entry*(1+settings.fee_rate)-stop*(1-slip)*(1-settings.fee_rate)
@@ -127,7 +128,8 @@ class RiskEngine:
         entry=reference*(1-slip if short else 1+slip)
         distance=direction*(entry-stop)
         if distance<.35*atr or direction*(target-entry)<=0: reject('Stop CFD incompatible avec le bruit ATR ou objectif invalide.')
-        try: structure=validate_structural_plan(structure_context,entry,stop,target,short=short,now_ms=now_ms)
+        try: structure=validate_structural_plan(structure_context,entry,stop,target,short=short,now_ms=now_ms,setup=decision.setup,
+            reference_price=(quote.ask if short else quote.bid) if decision.setup=='pullback' else None)
         except StructureRejected as exc: reject(str(exc))
         risk_pct=trade_risk_pct(decision,settings,equity,positions,portfolio_quotes,now_ms,risk_budget_pct)
         margin_pct=getattr(rules,'min_margin_pct',0)

@@ -6,12 +6,13 @@ No level is moved to manufacture a requested reward/risk ratio.
 from __future__ import annotations
 import math
 import time
+from .indicators import pullback_reference
 
 
 class StructureRejected(ValueError): pass
 
 
-def structural_levels(context, entry=None, direction='LONG', now_ms=None):
+def structural_levels(context, entry=None, direction='LONG', now_ms=None, setup=None, reference_price=None):
     if not isinstance(context,dict) or direction not in {'LONG','SHORT'}:
         raise StructureRejected('Contexte structurel M5/H1 absent ou invalide.')
     now_ms=int(time.time()*1000) if now_ms is None else now_ms
@@ -20,7 +21,10 @@ def structural_levels(context, entry=None, direction='LONG', now_ms=None):
         data=context.get(timeframe)
         if not isinstance(data,dict) or not isinstance(data.get('candles'),list) or len(data['candles'])<5:
             raise StructureRejected('Bougies clôturées M5/H1 insuffisantes pour valider la structure.')
-        bars=data['candles'];previous_end=-1
+        bars=(context.get('h1_structure_candles') or data['candles']) if timeframe=='h1' and setup=='pullback' else data['candles']
+        if not isinstance(bars,list) or len(bars)<5:
+            raise StructureRejected('Historique structurel H1 absent ou invalide.')
+        previous_end=-1
         for bar in bars:
             try:
                 values=[float(bar[k]) for k in ('open','high','low','close')]
@@ -41,16 +45,17 @@ def structural_levels(context, entry=None, direction='LONG', now_ms=None):
                 result['resistances'].append({'price':float(bar['high']),**common})
         # A breakout/consolidation has an observed range even without a local
         # fractal pivot. Exclude the newest signal candle from this setup range.
-        setup=bars[-7:-1]
+        range_bars=bars[-7:-1]
         for key,field,fn in [('supports','low',min),('resistances','high',max)]:
-            bar=fn(setup,key=lambda b:b[field])
+            bar=fn(range_bars,key=lambda b:b[field])
             result[key].append({'price':float(bar[field]),'timeframe':timeframe.upper(),
-                'pivot_at':bar['close_time'],'confirmed_at':setup[-1]['close_time'],
+                'pivot_at':bar['close_time'],'confirmed_at':range_bars[-1]['close_time'],
                 'source':'borne observée de la consolidation précédente'})
     try:
         atr=float(context['m5']['atr14'])
         price=float(entry if entry is not None else context['m5']['last']['close'])
-        if not math.isfinite(atr) or not math.isfinite(price) or atr<=0 or price<=0:raise ValueError()
+        market_price=float(reference_price) if reference_price is not None else price
+        if not all(math.isfinite(v) and v>0 for v in (atr,price,market_price)):raise ValueError()
     except (KeyError,TypeError,ValueError):
         raise StructureRejected('Prix ou ATR de structure indisponible.') from None
     # The latest CLOSED M5 candle can confirm a retest before its low/high
@@ -74,23 +79,45 @@ def structural_levels(context, entry=None, direction='LONG', now_ms=None):
             last['close']<old_support):
             result['resistances'].append({'price':float(max(old_support,last['high'])),
                 'broken_level':float(old_support),'observed_extreme':float(last['high']),**common})
+    pullback=None
+    if setup=='pullback':
+        instrument=context.get('instrument') or {}
+        symbol=(context.get('quote') or {}).get('symbol','')
+        cfd=str(symbol).startswith('CAP:') or str(instrument.get('asset_class','')).endswith('_cfd')
+        pullback=pullback_reference(context['m5'],context['h1'],short=direction=='SHORT',
+            require_volume=not(cfd or direction=='SHORT'),now_ms=now_ms)
+        if pullback is None:
+            raise StructureRejected('Reprise après repli non confirmée sur les bougies clôturées.')
+        result['supports' if direction=='LONG' else 'resistances'].append(pullback)
     for key in ('supports','resistances'):
         result[key].sort(key=lambda row:(row['price'],row['confirmed_at']))
-    below=[r for r in result['supports'] if r['price']<price]
-    above=[r for r in result['resistances'] if r['price']>price]
+    below=[r for r in result['supports'] if r['price']<market_price]
+    above=[r for r in result['resistances'] if r['price']>market_price]
+    if pullback is not None:
+        # This continuation strategy trades toward the next observed H1 level.
+        # M5 levels remain explicit intermediate obstacles, not hidden data.
+        minor=above if direction=='LONG' else below
+        result['minor_obstacles']=sorted((r for r in minor if r['timeframe']=='M5'),key=lambda r:abs(r['price']-market_price))
+        result['target_basis']='structure H1 observée'
+        below=[r for r in below if r['timeframe']=='H1']
+        above=[r for r in above if r['timeframe']=='H1']
     if direction=='LONG':
         stop=max(below,key=lambda r:(r['price'],r['confirmed_at']),default=None)
         target=min(above,key=lambda r:(r['price'],-r['confirmed_at']),default=None)
     else:
         stop=min(above,key=lambda r:(r['price'],-r['confirmed_at']),default=None)
         target=max(below,key=lambda r:(r['price'],r['confirmed_at']),default=None)
+    if pullback is not None:
+        # This setup protects the entire observed pullback zone, including the
+        # signal wick. A nearer old pivot must not silently tighten that stop.
+        stop=pullback if (pullback['price']<market_price if direction=='LONG' else pullback['price']>market_price) else None
     result.update(entry=price,atr=atr,stop_reference=stop,target_obstacle=target,
         stop_buffer=.15*atr,target_buffer=.1*atr)
     return result
 
 
-def validate_structural_plan(context,entry,stop,target,*,short=False,now_ms=None):
-    levels=structural_levels(context,entry,'SHORT' if short else 'LONG',now_ms)
+def validate_structural_plan(context,entry,stop,target,*,short=False,now_ms=None,setup=None,reference_price=None):
+    levels=structural_levels(context,entry,'SHORT' if short else 'LONG',now_ms,setup=setup,reference_price=reference_price)
     anchor=levels['stop_reference'];obstacle=levels['target_obstacle'];atr=levels['atr']
     if anchor is None:raise StructureRejected('Aucun pivot/support/résistance exploitable pour justifier le stop.')
     if obstacle is None:raise StructureRejected('Aucun obstacle connu pour justifier un objectif crédible : WAIT.')

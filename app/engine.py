@@ -5,7 +5,7 @@ from dataclasses import asdict
 from .config import Settings
 from .market import BinanceClient, MarketError
 from .multimarket import MultiMarket
-from .indicators import snapshot, candidates, short_candidates, long_refusals, short_refusals
+from .indicators import snapshot, candidates, short_candidates, long_refusals, short_refusals, pullback_reference
 from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
 from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
 from .structure import structural_levels
@@ -23,6 +23,11 @@ ENTRY_EVALUATION_SECONDS=10.
 class TradingEngine:
     def __init__(self,store,env,market=None,ai=None):
         self.store=store; self.env=env
+        saved_settings=store.get('settings')
+        if isinstance(saved_settings,dict) and 'strategy_profile' not in saved_settings:
+            # Persist the selected experiment once. Later releases must not
+            # silently change the profile through a different model default.
+            store.set('settings',{**saved_settings,'strategy_profile':Settings.model_fields['strategy_profile'].default})
         self.market=market or MultiMarket(env)
         self.ai=ai or AIClient(env.api_key,model=env.model)
         self.paper=PaperExecutionEngine(store)
@@ -171,7 +176,7 @@ class TradingEngine:
             'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,
             'position_open':bool(self.store.positions()),'open_positions_count':len(self.store.positions()),
             'max_positions':cfg.max_positions,'max_trade_risk_pct':cfg.max_trade_risk_pct,
-            'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct}
+            'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct,'strategy_profile':cfg.strategy_profile}
         state['scanner_summary']=scan_summary(self.scan)
         if hasattr(self.market,'status'):
             source=self.market.status().get('capital',{})
@@ -447,19 +452,36 @@ class TradingEngine:
                 self.rules[symbol]=rules;self.quotes[symbol]=q;data['quote']=asdict(q)
                 data['structure']={side:structural_levels(data,entry=q.ask if side=='BUY' else q.bid,
                     direction='LONG' if side=='BUY' else 'SHORT',now_ms=expected+1) for side in data['directions']}
-                bounds={side:market_feasibility(data,q,rules,cfg,short=side=='SHORT') for side in data['directions']}
+                setup_bounds={};bounds={}
+                def bound_rank(bound):
+                    status=bound.get('status')
+                    rr=bound.get('max_net_rr')
+                    return (2 if status=='feasible' else 1 if status=='unknown' else 0,
+                        rr if isinstance(rr,(int,float)) else -float('inf'))
+                for side in data['directions']:
+                    values={};classic=None
+                    for setup in data['direction_candidates'][side]:
+                        if setup=='pullback':
+                            values[setup]=market_feasibility(data,q,rules,cfg,short=side=='SHORT',setup='pullback')
+                        else:
+                            if classic is None:classic=market_feasibility(data,q,rules,cfg,short=side=='SHORT')
+                            values[setup]=classic
+                    setup_bounds[side]=values
+                    bounds[side]=max(values.values(),key=bound_rank)
+                data['setup_feasibility']=setup_bounds
                 data['feasibility']=bounds
                 row=by_symbol[symbol];row['feasibility']=bounds
+                row['setup_feasibility']=setup_bounds
                 row['technical_candidate']=True
                 row['reason']+=' — '+' | '.join(side+' : '+bound['reason'] for side,bound in bounds.items())
-                allowed=[side for side in data['directions'] if bounds[side].get('status') not in impossible]
+                allowed=[side for side in data['directions'] if any(b.get('status') not in impossible for b in setup_bounds[side].values())]
                 if not allowed:
                     row['status']='ATTENTE'
                     return None
                 # Keep the full bounds for diagnostics, but do not offer an
                 # impossible side to the model when the opposite side is valid.
                 data['directions']=allowed
-                data['direction_candidates']={side:values if side in allowed else []
+                data['direction_candidates']={side:[setup for setup in values if setup_bounds[side][setup].get('status') not in impossible] if side in allowed else []
                     for side,values in data['direction_candidates'].items()}
                 setups=list(dict.fromkeys(setup for side in allowed for setup in data['direction_candidates'][side]))
                 priority=0 if any(bounds[side].get('status')=='feasible' for side in allowed) else 1
@@ -541,6 +563,11 @@ class TradingEngine:
                 a,b=snapshot(m5),snapshot(h1)
                 setups=candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
                 shorts=short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
+                if cfg.strategy_profile=='expanded_v1':
+                    if pullback_reference(a,b,require_volume=not symbol.startswith('CAP:'),now_ms=expected+1):
+                        setups=list(dict.fromkeys([*setups,'pullback']))
+                    if symbol.startswith('CAP:') and cfg.allow_short and pullback_reference(a,b,short=True,require_volume=False,now_ms=expected+1):
+                        shorts=list(dict.fromkeys([*shorts,'pullback']))
                 spread=(quote.ask-quote.bid)/quote.bid*10000
                 if spread>cfg.max_spread_bps or a['atr_pct']>cfg.max_atr_pct:
                     setups=[];shorts=[]
@@ -553,6 +580,7 @@ class TradingEngine:
                     'direction_candidates':{'BUY':setups,'SHORT':shorts},
                     'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'},
                     'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else cfd_reason if symbol.startswith('CAP:') else '; '.join(long_refusals(a,b)) if not setups else None)}
+                if cfg.strategy_profile=='expanded_v1':data['h1_structure_candles']=[asdict(bar) for bar in h1]
                 # Market references come first. Never derive an objective from a
                 # desired multiple and then ask the model to justify that price.
                 data['structure']={side:structural_levels(data,entry=quote.ask if side=='BUY' else quote.bid,
@@ -632,7 +660,8 @@ class TradingEngine:
         for row in rows:
             if row.get('feasibility'):
                 log.info('PAPER_PLAN_REVIEW %s',json.dumps({'at':utcnow(),'symbol':row['symbol'],
-                    'bounds':row['feasibility']},ensure_ascii=False,allow_nan=False))
+                    'bounds':row['feasibility'],'setup_bounds':row.get('setup_feasibility'),
+                    'strategy_profile':cfg.strategy_profile},ensure_ascii=False,allow_nan=False))
         bounds={symbol:data.get('feasibility',{}) for symbol,data,_ in entry_results if data.get('feasibility')}
         if bounds:log.info('PAPER_FEASIBILITY_AUDIT %s',json.dumps({'at':utcnow(),'markets':bounds},ensure_ascii=False,allow_nan=False))
         stats,_=statistics(self.store,self.quotes);day=self.day_state(stats['equity'])
@@ -653,6 +682,7 @@ class TradingEngine:
             import copy
             markets={s:copy.deepcopy(data) for s,data,_ in results}
             for data in markets.values():
+                data.pop('h1_structure_candles',None)
                 data['m5']['candles']=data['m5']['candles'][-22:]
                 data['h1']['candles']=data['h1']['candles'][-12:]
             symbols=[r[0] for r in results]
@@ -789,6 +819,7 @@ class TradingEngine:
                             atr=structure_context['m5']['atr14'],now_ms=int(time.time()*1000),structure_context=structure_context,
                             portfolio_positions=held,portfolio_quotes=self.quotes,risk_budget_pct=budget/max(stats['equity'],1e-12)*100)
                         detail['structure_context']={'m5':structure_context['m5'],'h1':structure_context['h1']}
+                        if decision.setup=='pullback':detail['structure_context']['h1_structure_candles']=structure_context.get('h1_structure_candles',structure_context['h1']['candles'])
                         # The feed event can still be fresh while the local M5
                         # entry deadline has elapsed. Recheck at the last instant
                         # before booking an order, including time spent planning.

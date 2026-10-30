@@ -1,3 +1,9 @@
+# Profil de simulation élargi (30 octobre 2026)
+
+Le profil `expanded_v1`, affiché « Classique + reprises sur repli (v1) », ajoute des reprises M5 après un repli confirmé dans une tendance H1. Le stop protège la zone observée du repli ; l'objectif précède le premier niveau H1 opposé connu. Les petits niveaux M5 restent visibles pour l'analyse. La borne est calculée séparément pour chaque setup, avec les mêmes coûts, 2R net minimal et plafonds de risque. Le choix est enregistré et les nouvelles décisions/trades portent ce profil. L'ancien profil « Classique » reste disponible.
+
+Il s'agit d'une phase de test paper, pas d'une preuve de rentabilité ou de fréquence supérieure. Les essais historiques ne démontrent pas d'augmentation d'exécutions effectives, notamment parce que les signaux supplémentaires portaient sur un actif déjà détenu. [Règles, validation et limites du profil](docs/STRATEGY_PROFILE.md).
+
 # Diagnostic des entrées et coûts CFD (28 octobre 2026)
 
 Un retest M5 clôturé peut désormais fournir son support de stop, sans attendre la confirmation d'un pivot deux bougies plus tard. La référence protège à la fois le niveau cassé et l'extrême observé du retest ; le cas vendeur est symétrique. La marge ATR, le premier obstacle cible, les coûts, le ratio net minimal et les plafonds restent vérifiés. Aucun stop d'une position déjà ouverte n'est déplacé par cette extraction de références. Les journaux privés `PAPER_PLAN_REVIEW` incluent aussi les plans refusés, leur ratio net et leurs références, pour distinguer une insuffisance géométrique d'un refus IA ou d'un problème d'exécution.
