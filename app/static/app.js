@@ -84,6 +84,15 @@
     let daily = stats.daily;
     if (daily && !Array.isArray(daily)) daily = Object.entries(daily).map(([date,row]) => typeof row === 'object' ? {date,...row} : {date,net_pnl:row});
     smallTable('#dailyPerformance',['Date UTC','Trades','Résultat net'],array(daily).slice(-7).reverse().map(row => [row.date || row.day,num(row.trades ?? row.count,0),`${signed(row.net_pnl ?? row.pnl ?? row.realized_pnl)} USDT`]));
+    const experiment = stats.strategy_performance;
+    if (experiment) {
+      const current = experiment.current;
+      const profile = {expanded_v1:'Classique + reprises sur repli (v1)',classic:'Classique'}[experiment.active_profile] || experiment.active_profile;
+      set('#strategyProgress', `${num(current.closed_trades,0)} / ${num(experiment.review_target,0)}${experiment.review_due ? ' · Bilan à faire' : ''}`);
+      set('#strategySummary', `${profile} · ${signed(current.net_pnl)} USDT nets · ${num(current.winners,0)} gagnants / ${num(current.losers,0)} perdants · ${num(current.entry_days_utc,0)} jours d’entrée (UTC).`);
+      smallTable('#strategyPerformance',['Marché','Trades','Résultat net','Gain moyen','Perte moyenne','Facteur de profit'],array(experiment.current_groups).map(row => [row.market==='cfd'?'CFD démo':'Crypto Spot',num(row.closed_trades,0),`${signed(row.net_pnl)} USDT`,money(row.avg_win),money(row.avg_loss),num(row.profit_factor)]));
+      set('#strategyCaption', `${experiment.review_due ? 'Seuil de premier bilan atteint.' : `Encore ${num(experiment.remaining,0)} clôtures avant le premier bilan.`} Ce seuil ne valide pas la rentabilité ; plusieurs séances sont nécessaires. Attribution au profil enregistré à l’entrée, frais inclus. ${num(experiment.unattributed_closed_trades,0)} anciens trades sans profil sont exclus de ce compteur et conservés au bilan global.`);
+    }
   }
   function smallTable(selector, headings, rows) {
     const target = $(selector); target.replaceChildren();

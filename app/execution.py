@@ -27,6 +27,7 @@ class PaperExecutionEngine:
             structure=getattr(plan,'structure_audit',None) if plan is not None else stored_plan.get('structure_audit')
             data={'event':event,'at':utcnow(),'symbol':p['symbol'],'trade_id':p['id'],
                 'strategy_profile':((detail.get('context') or {}).get('rules') or {}).get('strategy_profile'),
+                'setup':(detail.get('proposal') or {}).get('setup'),
                 'kind':p.get('kind','spot'),'direction':p.get('direction','LONG'),
                 'entry':p['entry'],'stop_loss':p['stop_loss'],'take_profit':p['take_profit'],
                 'quantity':p['quantity'],'risk_usdt':p['risk_usdt'],

@@ -3,6 +3,7 @@ from collections import defaultdict
 import math
 from .risk import portfolio_remaining_risk
 from .execution import portfolio_valuations
+from .performance import strategy_performance
 
 def statistics(store,quotes):
     # Cash, open collateral and closed results must come from one DB snapshot,
@@ -51,5 +52,6 @@ def _statistics_locked(store,quotes):
         margin_used=sum(row.get('margin',0.) for row in positions),
         financing_total=sum(t.get('financing_accrued',0.) for t in trades)+sum(row.get('financing_usdt',0.) for row in positions),
         total_fees=sum(t['fees'] for t in trades)+sum(row['entry_fee'] for row in positions),by_symbol=dict(by),
-        daily=[{'date':d,**v} for d,v in sorted(daily.items())],btc_benchmark_equity=benchmark)
+        daily=[{'date':d,**v} for d,v in sorted(daily.items())],btc_benchmark_equity=benchmark,
+        strategy_performance=strategy_performance(trades,settings.get('strategy_profile','unattributed')))
     return stats,p

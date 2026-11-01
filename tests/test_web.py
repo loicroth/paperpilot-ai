@@ -49,6 +49,19 @@ async def token(c):
     assert response.status_code==200
     return {'X-CSRF-Token':response.json()['csrf_token']}
 
+
+@pytest.mark.asyncio
+async def test_state_exposes_profile_progress_without_mutating_settings_or_balance(web):
+    settings = web.store.get('settings')
+    async with client(web) as c:
+        state = (await c.get('/api/state')).json()
+        page = (await c.get('/')).text
+    report = state['stats']['strategy_performance']
+    assert report['active_profile'] == settings['strategy_profile']
+    assert report['current']['closed_trades'] == 0 and report['remaining'] == 50
+    assert web.store.get('settings') == settings and web.store.get('cash') == 900
+    assert 'strategyProgress' in page and 'strategyPerformance' in page
+
 def open_fixture(web):
     q=Quote('BTCUSDT',100.0,100.01,int(time.time()*1000))
     d=Decision(symbol='BTCUSDT',action='BUY',reason='Fixture HTTP : cassure.',entry=100.01,

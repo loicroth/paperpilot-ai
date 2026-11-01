@@ -13,6 +13,7 @@ from .entry_plans import build_entry_plans
 from .decision_audit import cfd_decision_record
 from .execution import PaperExecutionEngine
 from .metrics import statistics
+from .performance import strategy_performance
 from .storage import utcnow, dumps
 from .scan_audit import scan_summary
 from .opportunity import market_feasibility
@@ -52,6 +53,7 @@ class TradingEngine:
             mode='running'
         else: self.store.set('mode',mode)
         self.last_diagnostic=0.
+        self._last_performance_marker=None
         try: self.history_diagnostic()
         except Exception: log.warning('Rapport historique indisponible ; démarrage conservé.')
         self.store.event('Serveur démarré : '+{'running':'reprise de la simulation demandée','paused':'pause conservée','stopped':'arrêt conservé'}[mode]+', protection des positions conservée.')
@@ -183,6 +185,13 @@ class TradingEngine:
             state['cfd_source']={'connected':bool(source.get('connected')),'error':source.get('error'),
                 'supported':len(source.get('supported',[])),'blocked':len(source.get('blocked',[]))}
         log.info('PAPER_STATE %s',json.dumps(state,ensure_ascii=False))
+        # Refresh on a close/profile change and at startup; read-only and no API call.
+        trades=self.store.trades()
+        marker=(cfg.strategy_profile,len(trades),trades[0]['id'] if trades else None)
+        if marker!=self._last_performance_marker:
+            report=strategy_performance(trades,cfg.strategy_profile)
+            log.info('PAPER_PERFORMANCE %s',json.dumps(report,ensure_ascii=False,allow_nan=False))
+            self._last_performance_marker=marker
         return state
     def day_state(self,equity,now=None):
         day=(now or datetime.now(timezone.utc)).strftime('%Y-%m-%d')

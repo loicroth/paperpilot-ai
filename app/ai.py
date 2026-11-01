@@ -438,6 +438,31 @@ class AIClient:
                 message = "OpenAI : authentification refusée ou accès au modèle interdit. Vérifiez la clé et les permissions."
                 return _failure("authentication", "http", "authentication_or_access_denied", message)
             if response.status_code == 429:
+                # A 429 is not necessarily a transient rate limit. Only inspect
+                # documented codes/types; never log provider text or credentials.
+                try:
+                    envelope = response.json()
+                    error = envelope.get('error', {}) if isinstance(envelope, dict) else {}
+                    error = error if isinstance(error, dict) else {}
+                except ValueError:
+                    error = {}
+                messages = {
+                    'credit_balance_exhausted': 'Crédits API OpenAI épuisés. Vérifiez le solde dans la facturation OpenAI.',
+                    'organization_spend_limit_exceeded': 'Plafond de dépenses API OpenAI de l’organisation atteint.',
+                    'project_spend_limit_exceeded': 'Plafond de dépenses API OpenAI du projet atteint.',
+                    'organization_usage_limit_exceeded': 'Quota d’utilisation API OpenAI de l’organisation atteint.',
+                    'insufficient_quota': 'Quota API OpenAI indisponible : vérifiez les crédits et plafonds de facturation.',
+                    'rate_limit_exceeded': 'Limite temporaire de débit API OpenAI atteinte.',
+                    'slow_down': 'OpenAI demande de ralentir le rythme des requêtes API.',
+                }
+                code = error.get('code')
+                if not isinstance(code, str) or code not in messages:
+                    code = {'insufficient_quota': 'insufficient_quota',
+                            'rate_limit_error': 'rate_limit_exceeded'}.get(
+                                error.get('type') if isinstance(error.get('type'), str) else '')
+                if code in messages:
+                    return _failure('limits', 'http', code,
+                                    'OpenAI (HTTP 429) : ' + messages[code] + ' Aucune opération.')
                 message = "OpenAI : requête refusée (HTTP 429). Limite de requêtes ou quota API à vérifier."
                 return _failure("limits", "http", "request_limited", message)
             if not response.is_success:

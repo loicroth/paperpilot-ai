@@ -246,6 +246,40 @@ async def test_network_errors_do_not_expose_exception_text(error_type, code):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('error,expected', [
+    ({'code': 'credit_balance_exhausted', 'type': 'insufficient_quota'}, 'credit_balance_exhausted'),
+    ({'code': 'project_spend_limit_exceeded', 'type': 'insufficient_quota'}, 'project_spend_limit_exceeded'),
+    ({'code': 'organization_spend_limit_exceeded'}, 'organization_spend_limit_exceeded'),
+    ({'code': 'organization_usage_limit_exceeded'}, 'organization_usage_limit_exceeded'),
+    ({'code': 'insufficient_quota'}, 'insufficient_quota'),
+    ({'type': 'insufficient_quota'}, 'insufficient_quota'),
+    ({'code': 'rate_limit_exceeded'}, 'rate_limit_exceeded'),
+    ({'code': 'slow_down', 'type': 'rate_limit_error'}, 'slow_down'),
+    ({'type': 'rate_limit_error'}, 'rate_limit_exceeded'),
+    ({'code': ['sk-private'], 'type': {}}, 'request_limited'),
+])
+async def test_429_distinguishes_quota_and_rate_limits_without_exposing_provider_text(error, expected):
+    body = {'error': {**error, 'message': 'sk-private-provider-detail', 'organization': 'sk-private'}}
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429, json=body)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await AIClient('sk-private-key', client=http).decide(context())
+    assert result.error_kind == 'limits' and result.diagnostic['code'] == expected
+    assert result.decision.action == 'WAIT' and len(calls) == 1
+    assert 'sk-private' not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_non_json_429_keeps_generic_diagnostic():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(429, text='private-error'))) as http:
+        result = await AIClient('fixture', client=http).decide(context())
+    assert result.diagnostic['code'] == 'request_limited'
+    assert result.decision.action == 'WAIT' and 'private-error' not in repr(result)
+
+
+@pytest.mark.asyncio
 async def test_invalid_input_is_distinct_and_never_calls_provider():
     def handler(request):
         pytest.fail('Invalid input must not make a paid call or retry')
