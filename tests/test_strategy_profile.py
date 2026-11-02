@@ -29,7 +29,7 @@ class FrozenMarket:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('profile',['classic','expanded_v1'])
+@pytest.mark.parametrize('profile',['classic','expanded_v1','expanded_v2'])
 @pytest.mark.parametrize('spread',[0,5])
 async def test_profile_selects_exact_pullback_plan_and_executes_with_real_indicators(tmp_path,monkeypatch,profile,spread):
     market=FrozenMarket(spread)
@@ -37,6 +37,7 @@ async def test_profile_selects_exact_pullback_plan_and_executes_with_real_indica
     store=Store(tmp_path/'profile.sqlite3')
     cfg=Settings(symbols=[DATA['symbol']],strategy_profile=profile)
     store.set('settings',cfg.model_dump());store.set('mode','running')
+    store.set('management_v2_migrated',True)  # Explicit choice after the release migration.
     called=[]
     def handler(request):
         ctx=json.loads(json.loads(request.content)['input'][0]['content'][0]['text'])
@@ -64,7 +65,7 @@ async def test_profile_selects_exact_pullback_plan_and_executes_with_real_indica
         ref=pullback_reference(raw['m5'],raw['h1'],now_ms=market.now)
         assert audit['stop_reference']['price']==ref['price']
         assert len(raw['h1_structure_candles'])==150
-        assert p['detail']['context']['rules']['strategy_profile']=='expanded_v1'
+        assert p['detail']['context']['rules']['strategy_profile']==profile
         assert store.rows('SELECT rejection FROM decisions')[-1]['rejection'] is None
     store.close()
 
@@ -75,9 +76,10 @@ def test_profile_is_persisted_once_without_resetting_capital_or_mode(tmp_path):
     store.set('settings',cfg);store.set('mode','paused');store.set('cash',873.)
     fake=SimpleNamespace(model='fixture')
     TradingEngine(store,SimpleNamespace(api_key='',model='gpt-4o-mini'),market=FrozenMarket(),ai=fake)
-    assert store.get('settings')['strategy_profile']=='expanded_v1'
+    assert store.get('settings')['strategy_profile']=='expanded_v2'
     assert store.get('cash')==873. and store.get('mode')=='paused'
     store.set('settings',{**store.get('settings'),'strategy_profile':'classic'})
     TradingEngine(store,SimpleNamespace(api_key='',model='gpt-4o-mini'),market=FrozenMarket(),ai=fake)
     assert store.get('settings')['strategy_profile']=='classic'
     store.close()
+

@@ -14,7 +14,7 @@ class Settings(BaseModel):
     auto_scanner: bool = Field(default_factory=lambda: os.getenv('AUTO_SCANNER', 'false').lower() == 'true')
     scanner_limit: int = Field(default=30, ge=3, le=40)
     ai_shortlist: int = Field(default=4, ge=1, le=6)
-    strategy_profile: Literal['classic','expanded_v1'] = 'expanded_v1'
+    strategy_profile: Literal['classic','expanded_v1','expanded_v2'] = 'expanded_v1'
     cfd_enabled: bool = False
     cfd_leverage: float = Field(default=2, ge=1, le=5)
     allow_short: bool = True
@@ -66,4 +66,5 @@ class Environment:
         if self.host not in {'127.0.0.1','localhost','::1'} and len(self.password)<16:
             raise ValueError('Accès réseau : définissez DASHBOARD_PASSWORD (16 caractères minimum), avec HTTPS devant le serveur.')
         if not 1024<=self.port<=65535: raise ValueError('PORT invalide (1024–65535).')
+
 

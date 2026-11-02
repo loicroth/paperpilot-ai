@@ -2,6 +2,7 @@ from __future__ import annotations
 import json, math, time, logging
 from .storage import utcnow, dumps
 from .risk import cfd_fx
+from .intraday import cfd_entry_allowed, cfd_exit_due
 
 log=logging.getLogger('paperpilot')
 CFD_FINANCING_METHOD='Estimation prorata du temps écoulé ; ne reproduit pas le rollover exact du courtier.'
@@ -134,6 +135,8 @@ class PaperExecutionEngine:
 
     def _cfd_open(self,plan,quote,signal,decision,settings,detail):
         now=int(time.time()*1000)
+        if not cfd_entry_allowed(getattr(settings,'strategy_profile',None),now):
+            raise ValueError('Profil v2 : fenêtre quotidienne des entrées CFD fermée.')
         if not getattr(settings,'cfd_enabled',False): raise ValueError('Simulation CFD désactivée.')
         if not 0<=now-quote.time_ms<=15000: raise ValueError('Ouverture CFD bloquée : cotation périmée.')
         if quote.symbol!=plan.symbol or not str(plan.symbol).startswith('CAP:'): raise ValueError('Marché CFD incohérent.')
@@ -222,6 +225,8 @@ class PaperExecutionEngine:
         if allow_take_profit and (price<=p['take_profit'] if short else price>=p['take_profit']):
             return self._cfd_close(quote,'TAKE_PROFIT',{'method':'Objectif plafonné prudemment.'},price_cap=p['take_profit'])
         now=int(time.time()*1000)
+        if cfd_exit_due(p,now):
+            return self._cfd_close(quote,'FIN_JOURNEE_V2',{'method':'Échéance quotidienne 20:45 UTC ; premier cours frais négociable disponible. Aucun zéro frais garanti.'})
         opened=int(__import__('datetime').datetime.fromisoformat(p['opened_at']).timestamp()*1000)
         if now-opened>=86400000:
             return self._cfd_close(quote,'DUREE_MAX_24H',{'method':'Sortie au premier cours négociable après 24 h ; financement estimé.'})
@@ -305,4 +310,5 @@ def portfolio_valuations(store,quotes):
                 valuation_at=q.time_ms if q else p.get('last_market_at'))
         positions.append(p)
     return positions
+
 

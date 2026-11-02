@@ -1,6 +1,6 @@
 # Profil de simulation élargi (30 octobre 2026)
 
-Le profil `expanded_v1`, affiché « Classique + reprises sur repli (v1) », ajoute des reprises M5 après un repli confirmé dans une tendance H1. Le stop protège la zone observée du repli ; l'objectif précède le premier niveau H1 opposé connu. Les petits niveaux M5 restent visibles pour l'analyse. La borne est calculée séparément pour chaque setup, avec les mêmes coûts, 2R net minimal et plafonds de risque. Le choix est enregistré et les nouvelles décisions/trades portent ce profil. L'ancien profil « Classique » reste disponible.
+Le profil `expanded_v2`, affiché « Reprises + sorties structurées (v2) », conserve les entrées M5/H1, niveaux SL/TP et limites de risque de v1. Il remplace les clôtures discrétionnaires de l'IA par une invalidation H1 opposée vérifiée localement, en plus des protections SL/TP/marge. Les CFD visent une sortie quotidienne à 20:45 UTC, avec entrées en semaine avant 20:30 UTC. Les anciens profils et résultats restent séparés. Ce changement corrige la cohérence des sorties ; il ne démontre pas la rentabilité des entrées. Voir [STRATEGY_V2.md](docs/STRATEGY_V2.md).
 
 Il s'agit d'une phase de test paper, pas d'une preuve de rentabilité ou de fréquence supérieure. Les essais historiques ne démontrent pas d'augmentation d'exécutions effectives, notamment parce que les signaux supplémentaires portaient sur un actif déjà détenu. [Règles, validation et limites du profil](docs/STRATEGY_PROFILE.md).
 
@@ -113,4 +113,5 @@ Un VPS permanent est possible ultérieurement : **un seul processus**, dossier d
 - [Binance — filtres de trading](https://developers.binance.com/docs/binance-spot-api-docs/filters)
 - [OpenAI — Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 - [Architecture et garanties](docs/ARCHITECTURE.md)
+
 

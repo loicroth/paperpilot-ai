@@ -87,7 +87,7 @@
     const experiment = stats.strategy_performance;
     if (experiment) {
       const current = experiment.current;
-      const profile = {expanded_v1:'Classique + reprises sur repli (v1)',classic:'Classique'}[experiment.active_profile] || experiment.active_profile;
+      const profile = {expanded_v2:'Reprises + sorties structurées (v2)',expanded_v1:'Classique + reprises sur repli (v1)',classic:'Classique'}[experiment.active_profile] || experiment.active_profile;
       set('#strategyProgress', `${num(current.closed_trades,0)} / ${num(experiment.review_target,0)}${experiment.review_due ? ' · Bilan à faire' : ''}`);
       set('#strategySummary', `${profile} · ${signed(current.net_pnl)} USDT nets · ${num(current.winners,0)} gagnants / ${num(current.losers,0)} perdants · ${num(current.entry_days_utc,0)} jours d’entrée (UTC).`);
       smallTable('#strategyPerformance',['Marché','Trades','Résultat net','Gain moyen','Perte moyenne','Facteur de profit'],array(experiment.current_groups).map(row => [row.market==='cfd'?'CFD démo':'Crypto Spot',num(row.closed_trades,0),`${signed(row.net_pnl)} USDT`,money(row.avg_win),money(row.avg_loss),num(row.profit_factor)]));
@@ -207,7 +207,7 @@
     if (!dirtySettings) {
       const form = $('#settingsForm');
       for (const [key,value] of Object.entries(settings || {})) { const input = form.elements.namedItem(key); if (input) input.value = key === 'symbols' ? array(value).join(', ') : value; }
-      form.elements.strategy_profile.value = settings.strategy_profile ?? 'expanded_v1';
+      form.elements.strategy_profile.value = settings.strategy_profile ?? 'expanded_v2';
       if (n(settings.fee_rate) !== null) form.elements.fee_percent.value = Number((settings.fee_rate * 100).toFixed(5));
       if (form.elements.cfd_fee_percent) form.elements.cfd_fee_percent.value = Number(((settings.cfd_fee_rate ?? 0) * 100).toFixed(5));
     }
@@ -289,4 +289,5 @@
   $('#confirmReset').addEventListener('click',async()=>{if($('#resetConfirmation').value!=='REINITIALISER'){notify('Saisissez exactement REINITIALISER pour confirmer.',true);return;}if(await mutate('/api/reset','POST',{confirmation:'REINITIALISER'},'Portefeuille réinitialisé à 900 USDT virtuels.'))$('#resetDialog').close();});
   showView(location.hash.slice(1));refresh();setInterval(refresh,5000);
 })();
+
 

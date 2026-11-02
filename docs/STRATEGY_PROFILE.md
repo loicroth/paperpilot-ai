@@ -1,6 +1,6 @@
 # Profils de simulation — 30 octobre 2026
 
-`expanded_v1` ajoute au profil classique une reprise après repli en M5, avec objectif sur la structure H1. Il est activé pour la nouvelle phase de paper trading demandée. Le choix est enregistré une fois en base, affiché dans les paramètres et conservé dans les décisions et les trades. Un redémarrage conserve le portefeuille, les positions, les limites et le mode marche/pause/arrêt.
+`expanded_v1` ajoute au profil classique une reprise après repli en M5, avec objectif sur la structure H1. `expanded_v2` conserve ces mêmes entrées et les mêmes niveaux et risques, avec une nouvelle politique de sortie décrite dans [STRATEGY_V2.md](STRATEGY_V2.md). La mise à jour v2 migre une seule fois un choix v1 actif vers v2 ; un choix classique explicite et tout choix ultérieur restent respectés. Les décisions et trades gardent leur profil d'ouverture. Un redémarrage conserve le portefeuille, les positions, les limites et le mode marche/pause/arrêt.
 
 ## Reprise après repli
 
@@ -29,3 +29,4 @@ Une comparaison sur 40 cryptos et 45 h 40 de bougies publiques donne 4 à 5 obse
 Ces scénarios reconstruisent bid/ask autour des clôtures ; ce ne sont pas des cotations historiques exécutables. Ils évaluent les plans avec un portefeuille initialement vide, sans mesurer PnL, taux de réussite, concurrence des positions ou décisions IA réelles. Le jeu de développement a servi à la conception et ne constitue pas un test aveugle. Les données ne permettent aucune conclusion historique sur les CFD.
 
 Ce profil est une expérience prospective en simulation. L'augmentation des exécutions effectives et la rentabilité restent à mesurer sur les nouveaux trades, sans confondre nombre de signaux et bénéfice.
+

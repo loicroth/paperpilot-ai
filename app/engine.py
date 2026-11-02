@@ -6,7 +6,7 @@ from .config import Settings
 from .market import BinanceClient, MarketError
 from .multimarket import MultiMarket
 from .indicators import snapshot, candidates, short_candidates, long_refusals, short_refusals, pullback_reference
-from .ai import AIClient, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
+from .ai import AIClient, AIResult, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
 from .risk import RiskEngine, RiskRejected, portfolio_remaining_risk
 from .structure import structural_levels
 from .entry_plans import build_entry_plans
@@ -17,6 +17,8 @@ from .performance import strategy_performance
 from .storage import utcnow, dumps
 from .scan_audit import scan_summary
 from .opportunity import market_feasibility
+from .management import POLICY as MANAGEMENT_V2_POLICY, uses_v2_policy, opening_plan, management_decision
+from .intraday import cfd_entry_allowed
 
 log=logging.getLogger('paperpilot')
 ENTRY_EVALUATION_SECONDS=10.
@@ -29,6 +31,15 @@ class TradingEngine:
             # Persist the selected experiment once. Later releases must not
             # silently change the profile through a different model default.
             store.set('settings',{**saved_settings,'strategy_profile':Settings.model_fields['strategy_profile'].default})
+        if not store.get('management_v2_migrated',False):
+            # Authorized one-time paper policy upgrade. Never rewrite opening
+            # records or override a later explicit choice of the older profile.
+            with store.transaction():
+                current=store.get('settings')
+                if isinstance(current,dict) and current.get('strategy_profile')=='expanded_v1':
+                    store.set('settings',{**current,'strategy_profile':'expanded_v2'})
+                    store.event('Profil paper v2 activé : sorties sur règles vérifiables ; historique v1 conservé.')
+                store.set('management_v2_migrated',True)
         self.market=market or MultiMarket(env)
         self.ai=ai or AIClient(env.api_key,model=env.model)
         self.paper=PaperExecutionEngine(store)
@@ -572,7 +583,7 @@ class TradingEngine:
                 a,b=snapshot(m5),snapshot(h1)
                 setups=candidates(a,b,require_volume=False) if symbol.startswith('CAP:') else candidates(a,b)
                 shorts=short_candidates(a,b,require_volume=False) if symbol.startswith('CAP:') and cfg.allow_short else []
-                if cfg.strategy_profile=='expanded_v1':
+                if cfg.strategy_profile in {'expanded_v1','expanded_v2'}:
                     if pullback_reference(a,b,require_volume=not symbol.startswith('CAP:'),now_ms=expected+1):
                         setups=list(dict.fromkeys([*setups,'pullback']))
                     if symbol.startswith('CAP:') and cfg.allow_short and pullback_reference(a,b,short=True,require_volume=False,now_ms=expected+1):
@@ -584,12 +595,15 @@ class TradingEngine:
                 if symbol.startswith('CAP:') and not setups and not shorts:
                     cfd_reason='LONG : '+' / '.join(long_refusals(a,b))
                     cfd_reason+=(' | SHORT : '+' / '.join(short_refusals(a,b))) if cfg.allow_short else ' | SHORT désactivé'
+                if symbol.startswith('CAP:') and not cfd_entry_allowed(cfg.strategy_profile,int(time.time()*1000)):
+                    setups=[];shorts=[]
+                    cfd_reason='Profil v2 : fenêtre des entrées CFD fermée (semaine avant 20:30 UTC).'
                 data={'m5':a,'h1':b,'quote':asdict(quote),
                     'directions':(['BUY'] if setups else [])+(['SHORT'] if shorts else []),
                     'direction_candidates':{'BUY':setups,'SHORT':shorts},
                     'instrument':self.market.describe(symbol) if hasattr(self.market,'describe') else {'provider':'Binance Spot','asset_class':'crypto'},
                     'filter_reason':('Spread trop élevé' if spread>cfg.max_spread_bps else 'Volatilité supérieure au plafond configuré' if a['atr_pct']>cfg.max_atr_pct else cfd_reason if symbol.startswith('CAP:') else '; '.join(long_refusals(a,b)) if not setups else None)}
-                if cfg.strategy_profile=='expanded_v1':data['h1_structure_candles']=[asdict(bar) for bar in h1]
+                if cfg.strategy_profile in {'expanded_v1','expanded_v2'}:data['h1_structure_candles']=[asdict(bar) for bar in h1]
                 # Market references come first. Never derive an objective from a
                 # desired multiple and then ask the model to justify that price.
                 data['structure']={side:structural_levels(data,entry=quote.ask if side=='BUY' else quote.bid,
@@ -700,7 +714,12 @@ class TradingEngine:
                 'directions':{s:data['directions'] for s,data,_ in results},
                 'direction_candidates':{s:data['direction_candidates'] for s,data,_ in results},
                 'positions':[p for p in positions if not target or p['symbol']==target]}
-            if target: context['managed_symbol']=target
+            if target:
+                context['managed_symbol']=target
+                opening=next((p for p in held if p['symbol']==target),None)
+                if uses_v2_policy(opening):
+                    context['management_policy']=MANAGEMENT_V2_POLICY
+                    context['opening_plan']=opening_plan(opening)
             if mode=='entry':context['entry_plans']=build_entry_plans(results,cfg)
             return context
         calls=[]
@@ -730,17 +749,27 @@ class TradingEngine:
             errors.sort(key=lambda outcome:outcome['error_kind']=='invalid_decision')
             messages=list(dict.fromkeys(outcome['error'] for outcome in errors))
             self.health.update(ai_ok=False,ai_error=' ; '.join(messages),ai_error_kind=errors[0]['error_kind'])
-        else:
+        elif any(outcome.get('api_called',False) for outcome in outcomes):
             self.health.update(ai_ok=True,ai_error=None,ai_error_kind=None)
 
     async def _decide_and_execute(self,context,raw_markets,cfg,revision,expected,key,day):
+        local_management=(context.get('mode')=='management' and context.get('management_policy')==MANAGEMENT_V2_POLICY)
+        local_audit=None
         if context.get('mode')=='entry' and int(time.time()*1000)-expected>=65000:
             message='Fenêtre d’entrée expirée avant appel IA après clôture M5 (65 s).'
             self.store.decision(wait(message),message,{'context':context,'closed_candle_ms':expected})
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
             return {'error':None,'error_kind':None}
         reserve=sum(len(v.encode('utf-8')) for v in (dumps(context),SYSTEM_PROMPT,dumps(Decision.model_json_schema())))+MAX_OUTPUT_TOKENS+1000
-        if not self.env.api_key and not getattr(self.ai,'test_enabled',False):
+        if local_management:
+            opening=self.store.position(context['managed_symbol'])
+            # The position captured in context remains the identity fence below.
+            # A missing/replaced row must never be converted into an AI request.
+            captured=next((p for p in context.get('positions',[]) if p.get('symbol')==context['managed_symbol']),{})
+            decision,local_audit=management_decision(opening or captured,
+                raw_markets.get(context['managed_symbol'],{}),now_ms=int(time.time()*1000))
+            result=AIResult(decision)
+        elif not self.env.api_key and not getattr(self.ai,'test_enabled',False):
             result=await self.ai.decide(context)
         elif not self.store.reserve_usage(day,cfg.max_daily_calls,cfg.max_daily_tokens,reserve):
             self.store.decision(wait('Plafond API quotidien atteint.'),'Budget API épuisé',{'context':context})
@@ -753,9 +782,13 @@ class TradingEngine:
         decision=result.decision;rejection=result.error
         detail={'context':context,'proposal':decision.model_dump(),'api_error':result.error,'model':cfg.model,
             'usage':{'input_tokens':result.input_tokens,'output_tokens':result.output_tokens}}
+        if local_management:
+            detail['management_policy']=local_audit
+            detail['decision_source']='local_closed_h1_v2'
         kind=getattr(result,'error_kind',None);diagnostic=getattr(result,'diagnostic',None)
         if diagnostic: detail['ai_diagnostic']=diagnostic
-        outcome={'error':result.error,'error_kind':kind or ('operational' if result.error else None)}
+        outcome={'error':result.error,'error_kind':kind or ('operational' if result.error else None),
+            'local':local_management,'api_called':not local_management}
         if result.error:
             # Show failures immediately, but clear them only after every call in
             # this cycle has completed and its outcome has been aggregated.
@@ -783,6 +816,11 @@ class TradingEngine:
                     live=self.store.position(decision.symbol)
                     if target_identity is None or not live or self._position_identity(live)!=target_identity:
                         raise RiskRejected('Position de gestion clôturée ou remplacée pendant l’analyse.')
+                    if local_management:
+                        # A no-gap reconciliation does not replace the cache.
+                        # Retain the just-fetched executable quote for the local
+                        # protection priority and final close, not the scan quote.
+                        self.quotes[decision.symbol]=q
                     await self.reconcile(q,expected_identity=target_identity,
                         expected_generation=(self.started_ms,revision))
                     q=self.quotes.get(decision.symbol,q)
@@ -841,7 +879,20 @@ class TradingEngine:
                         live=self.store.position(decision.symbol)
                         if not live or target_identity is None or self._position_identity(live)!=target_identity:
                             raise RiskRejected('Position de gestion clôturée ou remplacée pendant l’analyse.')
-                        self.paper.sell(q,'SIGNAL_IA',detail)
+                        exit_reason='SIGNAL_IA'
+                        if local_management:
+                            # Fast risk protection has precedence even if a new
+                            # executable quote arrived during the H1 decision.
+                            self.paper.protect(q,allow_take_profit=self._position_reconciled.get(live['id'],False),portfolio_quotes=self.quotes)
+                            if not self.store.position(decision.symbol):
+                                self._set_reconciliation(live,True)
+                                raise RiskRejected('Protection SL/TP/marge prioritaire : position déjà clôturée.')
+                            checked,checked_audit=management_decision(live,raw_markets.get(decision.symbol,{}),now_ms=int(time.time()*1000))
+                            if checked.action!='SELL' or not checked_audit.get('condition_met'):
+                                raise RiskRejected('Invalidation H1 v2 absente ou données devenues non valides.')
+                            detail['management_policy']=checked_audit
+                            exit_reason=checked_audit['exit_reason']
+                        self.paper.sell(q,exit_reason,detail)
                         self._set_reconciliation(live,True)
                 elif decision.action=='HOLD':
                     if not self.store.position(decision.symbol):raise RiskRejected('HOLD sans position : aucun ordre.')
@@ -857,4 +908,5 @@ class TradingEngine:
                     'signal_id':key,'quote_age_ms':int(time.time()*1000)-reviewed.time_ms if reviewed else None},ensure_ascii=False))
             self.health['last_analysis_at']=self.store.get('last_analysis_at')
         return outcome
+
 

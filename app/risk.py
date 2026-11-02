@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import math, time
 from .structure import validate_structural_plan, StructureRejected
+from .intraday import cfd_entry_allowed
 
 class RiskRejected(ValueError): pass
 @dataclass
@@ -89,6 +90,9 @@ class RiskEngine:
     @staticmethod
     def cfd_plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None,structure_context=None,portfolio_positions=None,portfolio_quotes=None,risk_budget_pct=None):
         def reject(reason): raise RiskRejected(reason)
+        if not cfd_entry_allowed(getattr(settings,'strategy_profile',None),
+                                 int(time.time()*1000) if now_ms is None else now_ms):
+            reject('Profil v2 : entrées CFD en semaine avant 20:30 UTC ; clôture quotidienne visée à 20:45 UTC.')
         if not getattr(settings,'cfd_enabled',False): reject('Simulation CFD désactivée.')
         if decision.action not in {'BUY','SHORT'}: reject('Proposition sans ouverture CFD.')
         short=decision.action=='SHORT'; direction=-1 if short else 1
@@ -272,4 +276,5 @@ def remaining_position_risk(position,quote=None,now_ms=None):
 def portfolio_remaining_risk(positions,quotes=None,now_ms=None):
     quotes=quotes or {}
     return sum(remaining_position_risk(p,quotes.get(p['symbol']),now_ms) for p in positions)
+
 
