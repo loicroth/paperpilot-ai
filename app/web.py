@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, base64, csv, io, json, secrets, sqlite3
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -14,10 +15,56 @@ from .metrics import statistics
 from .storage import Store, utcnow
 
 
+def cfd_public_detail(detail):
+    """Trim retired market context for display; preserve the recorded CFD audit."""
+    if not isinstance(detail,dict): return detail
+    result=deepcopy(detail)
+    def symbol_allowed(symbol): return isinstance(symbol,str) and symbol.startswith('CAP:')
+    def crypto_class(value): return 'crypto' in str(value or '').lower()
+    def trim_scanner(scanner):
+        if not isinstance(scanner,dict): return
+        if isinstance(scanner.get('selected'),list):
+            scanner['selected']=[s for s in scanner['selected'] if symbol_allowed(s)]
+        if isinstance(scanner.get('rows'),list):
+            scanner['rows']=[row for row in scanner['rows'] if isinstance(row,dict) and symbol_allowed(row.get('symbol')) and not crypto_class(row.get('asset_class'))]
+        summary=scanner.get('summary')
+        if isinstance(summary,dict) and 'crypto' in (summary.get('groups') or {}):
+            # These totals described a mixed scan; do not imply they were CFD totals.
+            scanner.pop('summary')
+    def trim_context(context):
+        if not isinstance(context,dict): return
+        markets=context.get('markets')
+        excluded={s for s,data in markets.items() if isinstance(data,dict)
+                  and isinstance(data.get('instrument'),dict)
+                  and crypto_class(data['instrument'].get('asset_class'))} if isinstance(markets,dict) else set()
+        allowed=lambda symbol:symbol_allowed(symbol) and symbol not in excluded
+        if isinstance(context.get('symbols'),list):
+            context['symbols']=[s for s in context['symbols'] if allowed(s)]
+        for field in ('markets','candidates','directions','direction_candidates'):
+            if isinstance(context.get(field),dict):
+                context[field]={s:value for s,value in context[field].items() if allowed(s)}
+        for field in ('positions','entry_plans'):
+            if isinstance(context.get(field),list):
+                context[field]=[row for row in context[field] if isinstance(row,dict) and allowed(row.get('symbol'))]
+        rules=context.get('rules')
+        if isinstance(rules,dict):
+            if isinstance(rules.get('symbols'),list): rules['symbols']=[s for s in rules['symbols'] if allowed(s)]
+        trim_scanner(context.get('scanner'))
+    trim_context(result.get('context'))
+    trim_scanner(result.get('scanner'))
+    if isinstance(result.get('exit'),dict):
+        trim_context(result['exit'].get('context'))
+        trim_scanner(result['exit'].get('scanner'))
+    if result!=detail:
+        result['history_view']='Vue CFD : contexte des marchés retirés omis ; niveaux et résultats CFD conservés tels qu’enregistrés.'
+    return result
+
+
 def create_app(env=None,store=None,engine=None,background=True):
     env=env or Environment()
     db=store or Store(env.data_dir/'paperpilot.sqlite3')
     bot=engine or TradingEngine(db,env)
+    cfd_only=bool(getattr(env,'cfd_only',False))
     csrf=secrets.token_urlsafe(32)
     @asynccontextmanager
     async def lifespan(app):
@@ -61,7 +108,7 @@ def create_app(env=None,store=None,engine=None,background=True):
     @app.get('/api/state')
     async def state():
         try:
-            stats,p=statistics(db,bot.quotes)
+            stats,p=statistics(db,bot.quotes,cfd_only=cfd_only)
             day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
             usage=db.rows('SELECT calls,tokens FROM usage WHERE day=?',(day,))
             usage=usage[0] if usage else {'calls':0,'tokens':0}
@@ -69,19 +116,25 @@ def create_app(env=None,store=None,engine=None,background=True):
             usage.update(max_calls=cfg.max_daily_calls,max_tokens=cfg.max_daily_tokens)
             decisions=db.rows('SELECT * FROM decisions ORDER BY id DESC LIMIT 100')
             for row in decisions: row['detail']=json.loads(row['detail'])
+            trades=db.trades()[:250]
+            if cfd_only:
+                for row in decisions+trades+stats.get('positions',[]):
+                    row['detail']=cfd_public_detail(row.get('detail'))
             # Sample the long history for a bounded browser payload, exports keep full history.
             series=db.rows('SELECT at,equity,btc_equity FROM equity ORDER BY id')
+            if cfd_only:
+                for row in series: row['btc_equity']=None
             if len(series)>1500: series=series[::max(1,len(series)//1499)]+series[-1:]
             health=dict(bot.health)
             if health['last_quote_at']:
                 age=(datetime.now(timezone.utc)-datetime.fromisoformat(health['last_quote_at'])).total_seconds()
                 if age>20: health.update(market_ok=False,status='DONNÉES INDISPONIBLES',message='Dernière cotation trop ancienne. Aucune nouvelle entrée autorisée.')
             return {'providers':bot.market.status() if hasattr(bot.market,'status') else {},'scanner':bot.scan,'settings':cfg.model_dump(),'control':{'mode':db.get('mode')},'health':health,'stats':stats,'positions':stats.get('positions',[p] if p else []),'position':p,
-                'quotes':[{**asdict(q),'spread_bps':(q.ask-q.bid)/q.bid*10000} for q in bot.quotes.values()],
-                'decisions':decisions,'trades':db.trades()[:250], 'equity':series,
+                'quotes':[{**asdict(q),'spread_bps':(q.ask-q.bid)/q.bid*10000} for q in bot.quotes.values() if not cfd_only or q.symbol.startswith('CAP:')],
+                'decisions':decisions,'trades':trades, 'equity':series,
                 'events':db.rows('SELECT at,level,message FROM events ORDER BY id DESC LIMIT 60'),
                 'usage':usage,'csrf_token':csrf,'ai_configured':bool(env.api_key),'day_state':db.get('day_state'),
-                'paper_only':True,'session_started':db.get('session_started')}
+                'paper_only':True,'cfd_only':cfd_only,'session_started':db.get('session_started')}
         except sqlite3.Error:
             bot.health.update(market_ok=False,status='ERREUR',message='Base de données indisponible : entrées suspendues.')
             raise HTTPException(503,'Base de données indisponible.')
@@ -102,20 +155,29 @@ def create_app(env=None,store=None,engine=None,background=True):
         return {'ok':True,'mode':modes[action]}
     @app.put('/api/settings')
     async def settings(request:Request):
-        try: cfg=Settings.model_validate(await request.json())
+        try:
+            body=await request.json()
+            if cfd_only and isinstance(body,dict):
+                # Application scope is fixed server-side; crafted requests and
+                # old browser settings cannot reactivate the retired market.
+                body.update(cfd_only=True,cfd_enabled=True,auto_scanner=False,symbols=[])
+                for key in ('scanner_limit','fee_rate'):
+                    body.pop(key,None)
+            cfg=Settings.model_validate(body)
         except Exception as exc: raise HTTPException(422,str(exc)[:1000])
         def keep_held_markets():
-            if not cfg.auto_scanner and any(not p['symbol'].startswith('CAP:') and p['symbol'] not in cfg.symbols for p in db.positions()):
+            if not cfd_only and not cfg.auto_scanner and any(not p['symbol'].startswith('CAP:') and p['symbol'] not in cfg.symbols for p in db.positions()):
                 raise HTTPException(409,'Conservez les marchés de toutes les positions Spot ouvertes jusqu’à leur clôture.')
         keep_held_markets()
-        try: await bot.market.rules(cfg.symbols)
-        except Exception as exc: raise HTTPException(400,f'Validation Binance impossible : {str(exc)[:300]}')
+        if not cfd_only:
+            try: await bot.market.rules(cfg.symbols)
+            except Exception as exc: raise HTTPException(400,f'Validation Binance impossible : {str(exc)[:300]}')
         async with bot.lock:
             # A position can open while market rules are downloaded.
             keep_held_markets()
             db.set('settings',cfg.model_dump()); bot._settings_revision+=1
             # Re-evaluate a tighter daily threshold immediately.
-            stats,_=statistics(db,bot.quotes); bot.day_state(stats['equity'])
+            stats,_=statistics(db,bot.quotes,cfd_only=cfd_only); bot.day_state(stats['equity'])
             db.event('Paramètres enregistrés. Les frais de chaque position restent ceux de son ouverture.')
         return {'ok':True}
     @app.post('/api/providers/capital/setup')
@@ -133,7 +195,7 @@ def create_app(env=None,store=None,engine=None,background=True):
             await bot.market.setup_capital(body)
             async with bot.lock:
                 bot._settings_revision+=1; bot._h1={}
-                db.event('Source de cotations Capital.com démo connectée. Activez les CFD dans Paramètres pour les analyser.')
+                db.event('Source de cotations Capital.com démo connectée. Le scanner CFD est prêt ; démarrez le robot pour les analyser.' if cfd_only else 'Source de cotations Capital.com démo connectée. Activez les CFD dans Paramètres pour les analyser.')
         except Exception:
             raise HTTPException(400,'Connexion démo impossible. Vérifiez les trois champs et la disponibilité de Capital.com.') from None
         finally:
@@ -165,7 +227,10 @@ def create_app(env=None,store=None,engine=None,background=True):
         return csv_response(db.trades(),['id','symbol','kind','direction','currency','leverage','margin','opened_at','closed_at','entry','exit','quantity','fees','financing_accrued','net_pnl','risk_usdt','entry_reason','exit_reason'],'trades_paper.csv')
     @app.get('/api/export/stats.csv')
     async def export_stats():
-        stats,_=statistics(db,bot.quotes)
+        stats,_=statistics(db,bot.quotes,cfd_only=cfd_only)
+        if cfd_only:
+            for row in stats.get('positions',[]): row['detail']=cfd_public_detail(row.get('detail'))
         rows=[{'statistique':k,'valeur':json.dumps(v,ensure_ascii=False) if isinstance(v,(list,dict)) else v} for k,v in stats.items()]
         return csv_response(rows,['statistique','valeur'],'statistiques_paper.csv')
     return app
+

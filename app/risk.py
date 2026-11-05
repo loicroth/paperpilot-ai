@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import math, time
 from .structure import validate_structural_plan, StructureRejected
 from .intraday import cfd_entry_allowed
+from .config import CFD_ASSET_CLASSES
 
 class RiskRejected(ValueError): pass
 @dataclass
@@ -38,6 +39,8 @@ def floor_step(value,step):
 class RiskEngine:
     @staticmethod
     def plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None,structure_context=None,portfolio_positions=None,portfolio_quotes=None,risk_budget_pct=None):
+        if getattr(settings,'cfd_only',False) and not str(decision.symbol).startswith('CAP:'):
+            raise RiskRejected('Cryptomonnaies désactivées : marchés CFD uniquement.')
         if str(decision.symbol).startswith('CAP:'):
             return RiskEngine.cfd_plan(decision,quote,rules,settings,cash,equity,position,paused,day_blocked,atr,now_ms,structure_context,portfolio_positions,portfolio_quotes,risk_budget_pct)
         def reject(reason): raise RiskRejected(reason)
@@ -90,6 +93,8 @@ class RiskEngine:
     @staticmethod
     def cfd_plan(decision,quote,rules,settings,cash,equity,position=None,paused=False,day_blocked=False,atr=None,now_ms=None,structure_context=None,portfolio_positions=None,portfolio_quotes=None,risk_budget_pct=None):
         def reject(reason): raise RiskRejected(reason)
+        if getattr(settings,'cfd_only',False) and (not str(decision.symbol).startswith('CAP:') or getattr(rules,'asset_class',None) not in CFD_ASSET_CLASSES):
+            reject('Classe de contrat exclue : marchés CFD hors cryptomonnaies uniquement.')
         if not cfd_entry_allowed(getattr(settings,'strategy_profile',None),
                                  int(time.time()*1000) if now_ms is None else now_ms):
             reject('Profil v2 : entrées CFD en semaine avant 20:30 UTC ; clôture quotidienne visée à 20:45 UTC.')

@@ -9,7 +9,7 @@
   const isCFD = (item) => item?.kind === 'cfd' || String(item?.symbol || '').startsWith('CAP:');
   const priceDigits = (value, item) => n(value) === null ? 2 : isCFD(item) ? (n(value)<10?5:2) : n(value)<0.01?8:n(value)<1?6:n(value)<100?4:2;
   const priceText = (value, item) => `${num(value, priceDigits(value,item))} ${item?.currency || (isCFD(item) ? 'USD' : 'USDT')}`;
-  const assetName = (value) => ({crypto:'Crypto Spot',shares:'Actions CFD',share:'Actions CFD',equity:'Actions CFD',stock:'Actions CFD',etf:'ETF CFD',indices:'Indices CFD',index:'Indices CFD',forex:'Devises CFD',currencies:'Devises CFD',currency:'Devises CFD',commodities:'Matières premières CFD',commodity:'Matières premières CFD'}[String(value || '').toLowerCase()] || value || 'CFD');
+  const assetName = (value) => ({share_cfd:'Actions CFD',etf_cfd:'ETF CFD',index_cfd:'Indices CFD',forex_cfd:'Devises CFD',commodity_cfd:'Matières premières CFD',shares:'Actions CFD',share:'Actions CFD',equity:'Actions CFD',stock:'Actions CFD',etf:'ETF CFD',indices:'Indices CFD',index:'Indices CFD',forex:'Devises CFD',currencies:'Devises CFD',currency:'Devises CFD',commodities:'Matières premières CFD',commodity:'Matières premières CFD'}[String(value || '').toLowerCase()] || value || 'CFD');
   const signed = (value) => n(value) === null ? '—' : `${n(value) > 0 ? '+' : ''}${num(value)}`;
   const time = (value, short = false) => {
     if (value === null || value === undefined || value === '') return '—';
@@ -69,10 +69,13 @@
     set('#closedTrades', num(stats.closed_trades,0)); set('#winRate', n(stats.closed_trades) ? `${num(stats.win_rate,1)} %` : '—');
     set('#winsLosses', `${num(stats.winners,0)} gagnants · ${num(stats.losers,0)} perdants`);
     set('#unrealizedCaption', `Latent : ${signed(stats.unrealized_pnl)} USDT`);
+    const since=stats.equity_history_started_at;
+    set('#equityScope',since ? `Bilan CFD uniquement ; courbe de capital depuis le ${time(since)}. Les clôtures CFD conservées restent incluses dans le bilan. Les anciens résultats crypto sont exclus de ce bilan.` : 'Bilan CFD uniquement. La courbe se construit à partir des prochains relevés ; aucun historique de capital n’est reconstitué.');
+    set('#statisticsScope','Bilan CFD uniquement');
     const metrics = [
       ['Profit factor', n(stats.profit_factor) === null ? (stats.profit_factor === 'infinite' ? '∞' : '—') : num(stats.profit_factor)],
-      ['Drawdown maximal', `${num(stats.max_drawdown_pct)} %`],['Gain moyen net', money(stats.avg_win)],['Perte moyenne nette', money(stats.avg_loss)],
-      ['Ratio R réalisé moyen', num(stats.realized_rr)],['Frais cumulés', money(stats.total_fees)],['Gains latents', `${signed(stats.unrealized_pnl)} USDT`],['Conserver BTC · capital', money(stats.btc_benchmark_equity)]
+      [stats.max_drawdown_scope==='since_cfd_curve_start'?'Drawdown de la nouvelle courbe CFD':'Drawdown maximal', `${num(stats.max_drawdown_pct)} %`],['Gain moyen net', money(stats.avg_win)],['Perte moyenne nette', money(stats.avg_loss)],
+      ['Ratio R réalisé moyen', num(stats.realized_rr)],['Frais cumulés', money(stats.total_fees)],['Gains latents', `${signed(stats.unrealized_pnl)} USDT`]
     ];
     if (n(stats.margin_used) !== null) metrics.push(['Marge CFD immobilisée', money(stats.margin_used)]);
     if (n(stats.financing_total) !== null) metrics.push(['Financement CFD simulé cumulé', money(stats.financing_total)]);
@@ -90,8 +93,8 @@
       const profile = {expanded_v2:'Reprises + sorties structurées (v2)',expanded_v1:'Classique + reprises sur repli (v1)',classic:'Classique'}[experiment.active_profile] || experiment.active_profile;
       set('#strategyProgress', `${num(current.closed_trades,0)} / ${num(experiment.review_target,0)}${experiment.review_due ? ' · Bilan à faire' : ''}`);
       set('#strategySummary', `${profile} · ${signed(current.net_pnl)} USDT nets · ${num(current.winners,0)} gagnants / ${num(current.losers,0)} perdants · ${num(current.entry_days_utc,0)} jours d’entrée (UTC).`);
-      smallTable('#strategyPerformance',['Marché','Trades','Résultat net','Gain moyen','Perte moyenne','Facteur de profit'],array(experiment.current_groups).map(row => [row.market==='cfd'?'CFD démo':'Crypto Spot',num(row.closed_trades,0),`${signed(row.net_pnl)} USDT`,money(row.avg_win),money(row.avg_loss),num(row.profit_factor)]));
-      set('#strategyCaption', `${experiment.review_due ? 'Seuil de premier bilan atteint.' : `Encore ${num(experiment.remaining,0)} clôtures avant le premier bilan.`} Ce seuil ne valide pas la rentabilité ; plusieurs séances sont nécessaires. Attribution au profil enregistré à l’entrée, frais inclus. ${num(experiment.unattributed_closed_trades,0)} anciens trades sans profil sont exclus de ce compteur et conservés au bilan global.`);
+      smallTable('#strategyPerformance',['Marché','Trades','Résultat net','Gain moyen','Perte moyenne','Facteur de profit'],array(experiment.current_groups).filter(row=>row.market==='cfd').map(row => ['CFD démo',num(row.closed_trades,0),`${signed(row.net_pnl)} USDT`,money(row.avg_win),money(row.avg_loss),num(row.profit_factor)]));
+      set('#strategyCaption', `${experiment.review_due ? 'Seuil de premier bilan atteint.' : `Encore ${num(experiment.remaining,0)} clôtures avant le premier bilan.`} Ce seuil ne valide pas la rentabilité ; plusieurs séances sont nécessaires. Attribution au profil enregistré à l’entrée, frais inclus. ${num(experiment.unattributed_closed_trades,0)} anciens trades sans profil sont exclus de ce compteur et conservés au bilan CFD.`);
     }
   }
   function smallTable(selector, headings, rows) {
@@ -102,6 +105,7 @@
     rows.forEach(row => { const line = element('tr'); row.forEach(value => line.append(element('td','',value))); body.append(line); }); target.append(table);
   }
   function renderPositions(positions, settings, stats) {
+    positions=positions.filter(isCFD);
     const target=$('#positionContent'), panel=$('.position-panel'), limit=n(settings.max_positions) ?? 3;
     target.replaceChildren(); panel.classList.toggle('has-position',positions.length>0);
     set('#positionBadge',`${positions.length} / ${num(limit,0)}`);
@@ -116,19 +120,20 @@
     }
     target.className='positions-list';
     for (const position of positions) {
-      const cfd=isCFD(position), card=element('article',`open-position${cfd?' cfd-position':' spot-position'}`), heading=element('div','position-symbol');
+      const profile=position.detail?.context?.rules?.strategy_profile || 'classic';
+      const card=element('article','open-position cfd-position'), heading=element('div','position-symbol');
       const profit=element('span','badge',`${signed(position.unrealized_pnl)} USDT`);pnlClass(profit,position.unrealized_pnl);
       heading.append(element('strong','',position.symbol),profit);card.append(heading);
-      card.append(element('p','position-kind',cfd?`CFD démo · ${position.direction || 'LONG'} · prix en ${position.currency || 'USD'}`:'Crypto Spot · LONG · prix en USDT'));
+      card.append(element('p','position-kind',`CFD démo · ${position.direction || 'LONG'} · prix en ${position.currency || 'USD'}`));
       const grid=element('div','position-data');
       const values=[['Prix d’entrée',priceText(position.entry,position)],['Prix actuel',priceText(position.current_price,position)],['Quantité',num(position.quantity,8)],['Stop-loss',priceText(position.stop_loss,position)],['Take-profit',priceText(position.take_profit,position)],['Risque initial estimé',money(position.risk_usdt)],['Ouverte le',time(position.opened_at)]];
       const plan=position.detail?.plan, structure=plan?.structure_audit;
       if(structure?.validated) values.push(['Repère du stop',`${priceText(structure.stop_reference?.price,position)} · ${structure.stop_reference?.timeframe || ''}`],['Prochain obstacle',`${priceText(structure.target_obstacle?.price,position)} · ${structure.target_obstacle?.timeframe || ''}`],['Ratio net prévu à l’entrée',`${num(plan.rr)} R`]);
-      if(cfd) values.push(['Levier',`${num(position.leverage,1)}×`],['Marge immobilisée',money(position.margin)],['Financement simulé',money(position.financing_accrued)],['Durée maximale CFD','24 h puis première cotation négociable']);
+      values.push(['Levier',`${num(position.leverage,1)}×`],['Marge immobilisée',money(position.margin)],['Financement simulé',money(position.financing_accrued)],['Sortie CFD',profile==='expanded_v2'?'20:45 UTC, puis première cotation négociable':'24 h puis première cotation négociable']);
       values.forEach(([label,value])=>{const item=element('div');item.append(element('small','',label),element('strong','',value));grid.append(item);});card.append(grid);
       card.append(element('p','position-bottom',position.entry_reason || 'Protection virtuelle surveillée tant que les données sont disponibles.'));
-      card.append(detailButton(`Position ${position.symbol}`,`${cfd?'CFD démo':'Crypto Spot'} · ${position.direction || 'LONG'} · ${time(position.opened_at)}`,{
-        'Actif':position.symbol,'Type':cfd?'CFD démo':'Crypto Spot','Sens':position.direction || 'LONG',
+      card.append(detailButton(`Position ${position.symbol}`,`CFD démo · ${position.direction || 'LONG'} · ${time(position.opened_at)}`,{
+        'Actif':position.symbol,'Type':'CFD démo','Sens':position.direction || 'LONG',
         'Ouverture':time(position.opened_at),'Prix d’entrée':priceText(position.entry,position),'Prix actuel':priceText(position.current_price,position),
         'Quantité':num(position.quantity,8),'Stop-loss':priceText(position.stop_loss,position),'Take-profit':priceText(position.take_profit,position),
         'Résultat latent':`${signed(position.unrealized_pnl)} USDT`,'Risque initial estimé':money(position.risk_usdt),'Motif d’entrée':position.entry_reason || '—'
@@ -137,14 +142,15 @@
     }
   }
   function renderMarkets(quotes) {
+    quotes=quotes.filter(isCFD);
     const container = $('#markets'); container.replaceChildren();
     if (!quotes.length) { container.append(element('p','empty','En attente des cotations des sources connectées.')); return; }
     for (const quote of quotes) {
-      const cfd=isCFD(quote), base=String(quote.symbol).replace(/^CAP:/,'').replace(/USDT$/,''), line=element('div','market'), name=element('div','market-name',quote.label || (cfd?base:`${base} / USDT`)), price=element('div','market-price');
+      const base=String(quote.symbol).replace(/^CAP:/,''), line=element('div','market'), name=element('div','market-name',quote.label || base), price=element('div','market-price');
       const old=Date.now()-quote.time_ms>20000;
-      name.append(element('small','',cfd ? `CFD démo · ${quote.currency || 'USD'}${quote.market_status && quote.market_status!=='TRADEABLE'?' · '+quote.market_status:''}${old?' · voir heure':''}` : old ? 'Cotation du dernier scan · voir heure' : 'Spot · bid / ask observés'));
+      name.append(element('small','',`CFD démo · ${quote.currency || 'USD'}${quote.market_status && quote.market_status!=='TRADEABLE'?' · '+quote.market_status:''}${old?' · voir heure':''}`));
       price.append(element('strong','',priceText((n(quote.bid)!==null && n(quote.ask)!==null)?(n(quote.bid)+n(quote.ask))/2:null,quote)),element('small','',`Spread ${num(quote.spread_bps ?? ((quote.ask-quote.bid)/quote.bid*10000),2)} pb · ${time(quote.time_ms,true)}`));
-      line.append(element('span',`coin${cfd?' cfd-coin':''}`,cfd?'C':base==='BTC'?'₿':base==='ETH'?'Ξ':base.charAt(0)),name,price); container.append(line);
+      line.append(element('span','coin cfd-coin','C'),name,price); container.append(line);
     }
   }
   function renderProviders(providers, cfdEnabled) {
@@ -152,9 +158,9 @@
     box.replaceChildren(); markets.replaceChildren();
     const label=capital.connected?'CFD démo connectés':capital.configured?'CFD configurés · connexion à vérifier':'CFD non connectés';
     set('#capitalTag',capital.connected?'Démo connectée':capital.configured?'À vérifier':'Non connectés');
-    const text=capital.error || (capital.connected ? `Source de cotations CFD démo : ${supported.length} contrats validés. ${cfdEnabled ? 'Scanner CFD activé. Seuls les marchés ouverts et admissibles sont analysés lorsque le robot fonctionne.' : 'Scanner CFD désactivé : activez-le dans les paramètres pour analyser les marchés ouverts et admissibles.'}` : capital.configured ? 'Connexion enregistrée. Les contrats ne seront utilisés qu’après validation des cotations et des règles.' : 'Ajoutez une connexion Capital.com démo pour débloquer les cotations CFD.');
+    const text=capital.error || (capital.connected ? `Source de cotations CFD démo : ${supported.length} contrats validés. ${cfdEnabled ? 'Scanner CFD activé. Seuls les marchés ouverts et admissibles sont analysés lorsque le robot fonctionne.' : 'Scanner CFD en attente de la connexion de données.'}` : capital.configured ? 'Connexion enregistrée. Les contrats ne seront utilisés qu’après validation des cotations et des règles.' : 'Ajoutez une connexion Capital.com démo pour débloquer les cotations CFD.');
     set('#capitalStatus',text);
-    box.append(element('strong','',label),element('p','',text),element('small','muted-text','Binance Spot · CFD sur actions / ETF / indices / devises / matières premières selon les contrats validés · futures de bourse non intégrés.'));
+    box.append(element('strong','',label),element('p','',text),element('small','muted-text','CFD sur actions / ETF / indices / devises / matières premières selon les contrats validés · futures de bourse non intégrés.'));
     const fx=providers?.fx;
     if (fx?.error) box.append(element('p','rejection',`Conversion USD / USDT indisponible : ${fx.error}`));
     if (supported.length) {
@@ -170,12 +176,12 @@
     }
   }
   function renderScanner(scan, enabled) {
-    scan=scan || {}; const rows=array(scan.rows), selected=array(scan.selected);
+    scan=scan || {}; const rows=array(scan.rows).filter(isCFD), selected=array(scan.selected).filter(symbol=>String(symbol).startsWith('CAP:'));
     const counts=scan.summary, cfd=counts?.groups?.cfd;
     const tally=counts?`${counts.valid} marchés analysables sur ${counts.total}${cfd?.seen?` · CFD : ${cfd.valid}/${cfd.seen} analysables, ${cfd.candidates} signaux`:''}`:`${rows.length} marchés examinés`;
-    set('#scannerSummary', !enabled ? 'Liste manuelle active. Activez le scanner dans Paramètres pour élargir la recherche.' :
+    set('#scannerSummary', !enabled ? 'Le scanner CFD attend une connexion Capital.com démo prête.' :
       scan.error ? `Scan indisponible : ${scan.error}` : scan.at ? `${tally} · ${selected.length} retenus pour l’IA · ${time(scan.at)}` : 'Scanner activé : attend la prochaine clôture M5 après Démarrer.');
-    smallTable('#scannerRows',['Marché','Famille','État','Motif'],rows.map(r=>[r.label || r.symbol,assetName(r.asset_class || (String(r.symbol || '').startsWith('CAP:')?'CFD':'crypto')),selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
+    smallTable('#scannerRows',['Marché','Famille','État','Motif'],rows.map(r=>[r.label || r.symbol,assetName(r.asset_class || 'CFD'),selected.includes(r.symbol)?'SÉLECTION IA':r.status,r.reason]));
   }
   function renderDecision(decisions) {
     const decision = decisions[0], target = $('#lastDecision'); target.replaceChildren();
@@ -185,6 +191,7 @@
     target.append(detailButton(`${proposalLabels[decision.action] || 'Décision '+decision.action} · ${decision.symbol}`,time(decision.at),decision.detail || decision));
   }
   function renderTables(trades,decisions) {
+    trades=trades.filter(isCFD);
     const tradeBody = $('#tradesBody'); tradeBody.replaceChildren();
     if (!trades.length) { const row = element('tr'),cell = element('td','empty','Aucun trade clôturé. Aucun historique artificiel n’est généré.'); cell.colSpan=8; row.append(cell); tradeBody.append(row); }
     trades.forEach(trade => {
@@ -208,7 +215,6 @@
       const form = $('#settingsForm');
       for (const [key,value] of Object.entries(settings || {})) { const input = form.elements.namedItem(key); if (input) input.value = key === 'symbols' ? array(value).join(', ') : value; }
       form.elements.strategy_profile.value = settings.strategy_profile ?? 'expanded_v2';
-      if (n(settings.fee_rate) !== null) form.elements.fee_percent.value = Number((settings.fee_rate * 100).toFixed(5));
       if (form.elements.cfd_fee_percent) form.elements.cfd_fee_percent.value = Number(((settings.cfd_fee_rate ?? 0) * 100).toFixed(5));
     }
     set('#usageCalls',`${num(usage.calls,0)} / ${num(usage.max_calls ?? settings.max_daily_calls,0)} appels`);
@@ -218,14 +224,14 @@
     const points = series.filter(point => n(point.equity) !== null); const target = $('#equityChart'); target.replaceChildren();
     if (points.length < 2) { target.append(element('p','empty',points.length ? 'Premier relevé enregistré. La courbe se dessinera au fil du marché.' : 'La courbe apparaîtra après les premiers relevés du marché.')); return; }
     const width=720,height=240,left=58,right=16,top=12,bottom=32,availableW=width-left-right,availableH=height-top-bottom;
-    const values = points.flatMap(point => [n(point.equity),n(point.btc_equity)]).filter(value => value !== null);
+    const values = points.map(point => n(point.equity));
     let lo=Math.min(...values),hi=Math.max(...values); const margin=Math.max((hi-lo)*.2,1); lo-=margin;hi+=margin;
-    const svgNS='http://www.w3.org/2000/svg', svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Évolution du capital réel de simulation et comparaison avec conserver BTC');
+    const svgNS='http://www.w3.org/2000/svg', svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Évolution du portefeuille CFD en simulation');
     const add = (tag,attrs,text) => { const node=document.createElementNS(svgNS,tag); Object.entries(attrs).forEach(([key,value])=>node.setAttribute(key,value)); if(text!==undefined)node.textContent=text;svg.append(node);return node; };
     const y = value => top + (hi-value)/(hi-lo)*availableH, x = index => left+index/(points.length-1)*availableW;
     for(let i=0;i<4;i++){const value=lo+(hi-lo)*i/3,Y=y(value);add('line',{x1:left,y1:Y,x2:width-right,y2:Y,stroke:'#28394b','stroke-dasharray':'3 5','stroke-width':'.7'});add('text',{x:left-10,y:Y+3,fill:'#6f869e','font-size':'10','text-anchor':'end'},num(value,1));}
     [0,Math.floor((points.length-1)/2),points.length-1].forEach((index,i)=>add('text',{x:x(index),y:height-9,fill:'#6f869e','font-size':'9','text-anchor':i===0?'start':i===2?'end':'middle'},time(points[index].at)));
-    ['btc_equity','equity'].forEach((key,index)=>{let path='',active=false;points.forEach((point,i)=>{if(n(point[key])===null){active=false;return;}path+=`${active?'L':'M'}${x(i).toFixed(2)},${y(n(point[key])).toFixed(2)} `;active=true;});if(path)add('path',{d:path,fill:'none',stroke:index?'#3ad4b2':'#f5ac62','stroke-width':index?'2.5':'1.6','stroke-linejoin':'round','stroke-linecap':'round',opacity:index?'1':'.75'});});
+    ['equity'].forEach((key)=>{let path='',active=false;points.forEach((point,i)=>{if(n(point[key])===null){active=false;return;}path+=`${active?'L':'M'}${x(i).toFixed(2)},${y(n(point[key])).toFixed(2)} `;active=true;});if(path)add('path',{d:path,fill:'none',stroke:'#3ad4b2','stroke-width':'2.5','stroke-linejoin':'round','stroke-linecap':'round',opacity:'1'});});
     add('circle',{cx:x(points.length-1),cy:y(n(points.at(-1).equity)),r:3.5,fill:'#3ad4b2',stroke:'#133c35','stroke-width':3}); target.append(svg);
   }
   function render(data) {
@@ -259,12 +265,12 @@
   $('#settingsForm').addEventListener('input',()=>{dirtySettings=true;set('#settingsSaved','Modifications non enregistrées');});
   $('#settingsForm').addEventListener('submit',async(event)=>{
     event.preventDefault();const form=event.target;if(!form.reportValidity())return;
-    const body={};for(const key of ['risk_pct','max_trade_risk_pct','max_portfolio_risk_pct','max_positions','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','scanner_limit','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
-    body.auto_scanner=form.elements.auto_scanner.value==='true';
+    const body={};for(const key of ['risk_pct','max_trade_risk_pct','max_portfolio_risk_pct','max_positions','daily_loss_pct','min_rr','slippage_bps','max_spread_bps','max_atr_pct','entry_tolerance_atr','max_daily_calls','max_daily_tokens','ai_shortlist','cfd_leverage','cfd_financing_daily','cfd_scan_limit'])body[key]=Number(form.elements.namedItem(key).value);
+    body.cfd_only=true;body.auto_scanner=false;body.symbols=[];
     body.strategy_profile=form.elements.strategy_profile.value;
-    body.cfd_enabled=form.elements.cfd_enabled.value==='true';
+    body.cfd_enabled=true;
     body.allow_short=form.elements.allow_short.value==='true';
-    body.symbols=[...new Set(form.elements.symbols.value.toUpperCase().split(/[,;\s]+/).map(x=>x.replace('/','')).filter(Boolean))];body.model=form.elements.model.value.trim();body.fee_rate=Number(form.elements.fee_percent.value)/100;
+    body.model=form.elements.model.value.trim();
     body.cfd_fee_rate=Number(form.elements.cfd_fee_percent.value)/100;
     const ok=await mutate('/api/settings','PUT',body,'Paramètres enregistrés.');if(ok){dirtySettings=false;set('#settingsSaved','Enregistré');await refresh();}
   });
@@ -275,7 +281,7 @@
     const body={identifier:form.elements.identifier.value.trim(),api_key:form.elements.api_key.value.trim(),api_password:form.elements.api_password.value};
     try {
       await request('/api/providers/capital/setup','POST',body);
-      form.reset(); await refresh(); notify('Connexion démo enregistrée. Activez le scanner CFD dans les paramètres.');
+      form.reset(); await refresh(); notify('Connexion démo enregistrée. Le scanner CFD est prêt au prochain démarrage du robot.');
     } catch (_) {
       // Credential setup errors must never echo an API response that could contain a secret.
       set('#capitalStatus','Connexion démo impossible. Vérifiez votre e-mail, votre clé et le mot de passe API personnalisé, puis réessayez.');

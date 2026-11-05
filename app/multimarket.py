@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 from .market import BinanceClient, MarketError
 from .capital import CapitalClient
+from .config import CFD_ASSET_CLASSES
 
 class DollarConversion:
     def __init__(self, client=None):
@@ -40,7 +41,8 @@ class DollarConversion:
 
 class MultiMarket:
     def __init__(self, env, binance=None, capital=None, fx=None):
-        self.binance=binance or BinanceClient(env.binance_url)
+        self.cfd_only=bool(getattr(env,'cfd_only',False))
+        self.binance=binance if binance is not None else (None if self.cfd_only else BinanceClient(env.binance_url))
         directory=getattr(env,'data_dir',None)
         self.credentials_path=Path(directory)/'capital-demo-credentials.json' if directory else None
         credentials=self._load()
@@ -87,11 +89,16 @@ class MultiMarket:
             self.catalog_rows=rows;self.catalog_at=0.;self.catalog_error=None
             await old.close()
     async def server_time(self):
+        if self.cfd_only:
+            if not self.capital.configured:raise MarketError('Compte de cotations Capital.com démo non connecté.')
+            return await self.capital.server_time()
         try: return await self.binance.server_time()
         except MarketError:
             if self.capital.configured: return await self.capital.server_time()
             raise
-    async def liquid_symbols(self,limit): return await self.binance.liquid_symbols(limit)
+    async def liquid_symbols(self,limit):
+        if self.cfd_only:return []
+        return await self.binance.liquid_symbols(limit)
     async def cfd_symbols(self,limit):
         if not self.capital.configured:
             self.catalog_error='Compte de cotations Capital.com démo non connecté.'
@@ -103,7 +110,8 @@ class MultiMarket:
                         self.catalog_rows=await self.capital.catalog(limit)
                         self.catalog_at=time.monotonic();self.catalog_limit=limit
             self.catalog_error=None
-            return [r['symbol'] for r in self.catalog_rows if r.get('supported') and r.get('market_status',r.get('status'))=='TRADEABLE'][:limit]
+            return [r['symbol'] for r in self.catalog_rows if r.get('supported') and r.get('market_status',r.get('status'))=='TRADEABLE'
+                and (not self.cfd_only or (r['symbol'].startswith('CAP:') and r.get('asset_class') in CFD_ASSET_CLASSES))][:limit]
         except Exception as exc:
             self.catalog_error=str(exc)[:200]
             return []
@@ -120,7 +128,9 @@ class MultiMarket:
             'blocked':[r for r in self.catalog_rows if not r.get('supported')]},
             'fx':{'configured':True,'source':'Kraken USDT/USD','last':self.fx.cached,'error':self.fx.error}}
     async def quote(self,symbol):
-        if not symbol.startswith('CAP:'): return await self.binance.quote(symbol)
+        if not symbol.startswith('CAP:'):
+            if self.cfd_only:raise MarketError('Cryptomonnaies désactivées : marchés CFD uniquement.')
+            return await self.binance.quote(symbol)
         q=await self.capital.quote(symbol);rates=await self.fx.rates()
         now=int(time.time()*1000)
         if not 0<=now-q.time_ms<=15000 or not 0<=now-rates['at']<=15000:
@@ -128,11 +138,20 @@ class MultiMarket:
         return replace(q,conversion_rate=rates['ask'],conversion_bid=rates['bid'],conversion_ask=rates['ask'])
     async def rules(self,symbols):
         crypto=[s for s in symbols if not s.startswith('CAP:')];cfd=[s for s in symbols if s.startswith('CAP:')]
-        a,b=await asyncio.gather(self.binance.rules(crypto),self.capital.rules(cfd))
-        return {**a,**b}
+        if self.cfd_only and crypto:raise MarketError('Cryptomonnaies désactivées : marchés CFD uniquement.')
+        requests=[]
+        if crypto:requests.append(self.binance.rules(crypto))
+        if cfd:requests.append(self.capital.rules(cfd))
+        result={}
+        for batch in await asyncio.gather(*requests):result.update(batch)
+        if self.cfd_only and any(getattr(r,'asset_class',None) not in CFD_ASSET_CLASSES for r in result.values()):
+            raise MarketError('Classe de contrat exclue : marchés CFD hors cryptomonnaies uniquement.')
+        return result
     async def candles(self,symbol,*args,**kwargs):
+        if self.cfd_only and not symbol.startswith('CAP:'):
+            raise MarketError('Cryptomonnaies désactivées : marchés CFD uniquement.')
         client=self.capital if symbol.startswith('CAP:') else self.binance
         return await client.candles(symbol,*args,**kwargs)
     async def close(self):
-        await asyncio.gather(self.binance.close(),self.capital.close(),self.fx.close())
+        await asyncio.gather(*(client.close() for client in (self.binance,self.capital,self.fx) if client is not None))
 

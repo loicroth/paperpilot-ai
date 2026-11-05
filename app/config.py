@@ -2,19 +2,23 @@ from __future__ import annotations
 import os
 from typing import Literal
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / '.env')
+CFD_ASSET_CLASSES = frozenset({'share_cfd','etf_cfd','index_cfd','forex_cfd','commodity_cfd'})
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
-    symbols: list[str] = Field(default_factory=lambda: ['BTCUSDT','ETHUSDT','SOLUSDT'], min_length=1, max_length=12)
+    symbols: list[str] = Field(default_factory=lambda: ['BTCUSDT','ETHUSDT','SOLUSDT'], max_length=12)
     auto_scanner: bool = Field(default_factory=lambda: os.getenv('AUTO_SCANNER', 'false').lower() == 'true')
     scanner_limit: int = Field(default=30, ge=3, le=40)
     ai_shortlist: int = Field(default=4, ge=1, le=6)
     strategy_profile: Literal['classic','expanded_v1','expanded_v2'] = 'expanded_v1'
+    # False only preserves compatibility with historic fixtures and tooling.
+    # Environment and TradingEngine enforce the deployed application's scope.
+    cfd_only: bool = False
     cfd_enabled: bool = False
     cfd_leverage: float = Field(default=2, ge=1, le=5)
     allow_short: bool = True
@@ -36,6 +40,21 @@ class Settings(BaseModel):
     max_daily_calls: int = Field(default=288, ge=0, le=288)
     max_daily_tokens: int = Field(default=2000000, ge=0, le=5000000)
 
+    @model_validator(mode='before')
+    @classmethod
+    def scope_markets(cls, values):
+        if isinstance(values,dict) and values.get('cfd_only') is True:
+            return {**values,'symbols':[],'auto_scanner':False,'cfd_enabled':True}
+        return values
+
+    @model_validator(mode='after')
+    def enforce_market_scope(self):
+        if self.cfd_only:
+            self.symbols=[];self.auto_scanner=False;self.cfd_enabled=True
+        if not self.cfd_only and not self.symbols:
+            raise ValueError('Au moins un marché Spot requis hors du mode CFD uniquement.')
+        return self
+
     @field_validator('symbols')
     @classmethod
     def valid_symbols(cls, values):
@@ -47,6 +66,8 @@ class Settings(BaseModel):
 
 class Environment:
     def __init__(self):
+        # Application intent, deliberately not an environment-variable toggle.
+        self.cfd_only = True
         self.api_key = os.getenv('OPENAI_API_KEY','').strip()
         self.model = os.getenv('OPENAI_MODEL','gpt-4o-mini').strip()
         self.data_dir = Path(os.getenv('DATA_DIR', str(ROOT/'data'))).expanduser()

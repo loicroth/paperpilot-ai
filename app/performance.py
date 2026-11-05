@@ -45,10 +45,12 @@ def _summary(trades):
     }
 
 
-def strategy_performance(trades, active_profile):
+def strategy_performance(trades, active_profile, *, cfd_only=False):
     """50 is a review milestone, not a statistical validation or trading gate."""
     closed = [t for t in trades if t.get('closed_at') and
               isinstance(t.get('net_pnl'), (int, float)) and math.isfinite(t['net_pnl'])]
+    if cfd_only:
+        closed = [t for t in closed if t.get('kind') == 'cfd' or t['symbol'].startswith('CAP:')]
     cohorts = defaultdict(list)
     for trade in closed:
         market = 'cfd' if trade.get('kind') == 'cfd' or trade['symbol'].startswith('CAP:') else 'crypto'
@@ -59,11 +61,13 @@ def strategy_performance(trades, active_profile):
               for (profile, market), rows in sorted(cohorts.items())]
     current_groups = [{'profile': active_profile, 'market': market,
                        **_summary(cohorts.get((active_profile, market), []))}
-                      for market in ('crypto', 'cfd')]
+                      for market in (('cfd',) if cfd_only else ('crypto', 'cfd'))]
     return {
+        'scope': 'cfd_only' if cfd_only else 'all_markets',
         'active_profile': active_profile, 'review_target': REVIEW_TRADES,
         'remaining': max(0, REVIEW_TRADES - len(current)),
         'review_due': len(current) >= REVIEW_TRADES,
         'unattributed_closed_trades': sum(recorded_profile(t) == 'unattributed' for t in closed),
         'current': summary, 'current_groups': current_groups, 'groups': groups,
     }
+

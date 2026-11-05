@@ -10,6 +10,7 @@ def dumps(value): return json.dumps(value, ensure_ascii=False, allow_nan=False, 
 
 class Store:
     def __init__(self, path):
+        self.path = Path(path).resolve()
         had_file=Path(path).exists() and Path(path).stat().st_size>0
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -113,6 +114,10 @@ class Store:
         with self.lock:
             # Unknown usage (timeout) keeps the full conservative reservation.
             if actual>0: self.conn.execute('UPDATE usage SET tokens=MAX(0,tokens+?) WHERE day=?',(actual-reserve,day))
+    def retire_crypto(self, now=None):
+        """Explicit CFD-only startup migration; never run for legacy callers."""
+        from .crypto_retirement import retire_crypto
+        return retire_crypto(self, now=now)
     def reset(self, force=False):
         with self.transaction():
             if self.position() and not force: raise ValueError('Fermez toutes les positions avant de réinitialiser le portefeuille.')
@@ -121,7 +126,11 @@ class Store:
             for key in ('day_state','btc_baseline','last_equity','last_analysis_at','last_cycle','market_ready_after',
                         'reconcile_pending','reconcile_pending_by_id','last_managed_position_id'):
                 self.conn.execute('DELETE FROM kv WHERE key=?',(key,))
-            self.set('cash',900.0); self.set('initial_capital',900.0); self.set('session_started',utcnow())
+            started_at=utcnow()
+            self.set('cash',900.0); self.set('initial_capital',900.0); self.set('session_started',started_at)
+            if (self.get('settings') or {}).get('cfd_only') or self.get('crypto_retirement_v1'):
+                self.set('statistics_scope_started_at',started_at)
             self.event('Portefeuille réinitialisé à 900 USDT. Le budget API du jour est conservé.')
     def close(self):
         with self.lock: self.conn.close()
+

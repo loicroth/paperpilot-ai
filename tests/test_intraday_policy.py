@@ -51,6 +51,9 @@ def mark_v2(db):
 def test_daily_exit_uses_current_side_and_survives_missed_deadline(book,monkeypatch,short):
     now=[ms('2026-11-02T12:00:00+00:00')]
     monkeypatch.setattr('app.execution.time.time',lambda:now[0]/1000)
+    # The persisted opening timestamp must use the same simulated clock as
+    # protection, otherwise this test drifts when the real calendar advances.
+    monkeypatch.setattr('app.execution.utcnow',lambda:datetime.fromtimestamp(now[0]/1000,timezone.utc).isoformat(timespec='milliseconds'))
     db,paper=book;open_position(book,short=short);mark_v2(db)
     now[0]=ms('2026-11-02T20:44:59+00:00')
     assert paper.protect(quote()) is None and db.position()

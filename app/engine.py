@@ -3,7 +3,7 @@ import asyncio, logging, time, json, os
 from datetime import datetime, timezone
 from dataclasses import asdict
 from .config import Settings
-from .market import BinanceClient, MarketError
+from .market import MarketError
 from .multimarket import MultiMarket
 from .indicators import snapshot, candidates, short_candidates, long_refusals, short_refusals, pullback_reference
 from .ai import AIClient, AIResult, Decision, wait, SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, validate_context
@@ -40,6 +40,13 @@ class TradingEngine:
                     store.set('settings',{**current,'strategy_profile':'expanded_v2'})
                     store.event('Profil paper v2 activé : sorties sur règles vérifiables ; historique v1 conservé.')
                 store.set('management_v2_migrated',True)
+        if getattr(env,'cfd_only',False):
+            # Archive the virtual crypto ledger and restore its cash effects
+            # before any history, balance, protection or scanner is started.
+            # A migration failure must abort startup, never resume mixed trading.
+            retirement=store.retire_crypto()
+            store.set('settings',self.settings().model_dump())
+            log.info('PAPER_CRYPTO_RETIREMENT %s',json.dumps(retirement,ensure_ascii=False,allow_nan=False))
         self.market=market or MultiMarket(env)
         self.ai=ai or AIClient(env.api_key,model=env.model)
         self.paper=PaperExecutionEngine(store)
@@ -68,7 +75,17 @@ class TradingEngine:
         try: self.history_diagnostic()
         except Exception: log.warning('Rapport historique indisponible ; démarrage conservé.')
         self.store.event('Serveur démarré : '+{'running':'reprise de la simulation demandée','paused':'pause conservée','stopped':'arrêt conservé'}[mode]+', protection des positions conservée.')
-    def settings(self): return Settings.model_validate(self.store.get('settings'))
+    def settings(self):
+        values=self.store.get('settings')
+        if getattr(self.env,'cfd_only',False):values={**values,'cfd_only':True}
+        return Settings.model_validate(values)
+    def _enforce_market_scope(self,cfg):
+        if cfg.cfd_only:
+            # Defensive pruning also covers an old cache restored by tooling.
+            for cache in (self.quotes,self.rules,self._h1):
+                for symbol in list(cache):
+                    if not symbol.startswith('CAP:'):cache.pop(symbol)
+            self._universe=[]
     async def start(self):
         self.task=asyncio.create_task(self.run())
         if self.env.api_key: self.verify_task=asyncio.create_task(self.verify_ai())
@@ -186,7 +203,7 @@ class TradingEngine:
             'ai_error':self.health.get('ai_error'),'ai_error_kind':self.health.get('ai_error_kind'),'status':self.health['status'],
             'message':self.health.get('message'),'last_analysis_at':self.health['last_analysis_at'],
             'scan_count':len(self.scan['rows']),'candidate_count':len(self.scan['selected']),
-            'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,
+            'cfd_configured':bool(provider and provider.configured),'cfd_enabled':cfg.cfd_enabled,'cfd_only':cfg.cfd_only,
             'position_open':bool(self.store.positions()),'open_positions_count':len(self.store.positions()),
             'max_positions':cfg.max_positions,'max_trade_risk_pct':cfg.max_trade_risk_pct,
             'max_portfolio_risk_pct':cfg.max_portfolio_risk_pct,'strategy_profile':cfg.strategy_profile}
@@ -200,7 +217,7 @@ class TradingEngine:
         trades=self.store.trades()
         marker=(cfg.strategy_profile,len(trades),trades[0]['id'] if trades else None)
         if marker!=self._last_performance_marker:
-            report=strategy_performance(trades,cfg.strategy_profile)
+            report=strategy_performance(trades,cfg.strategy_profile,cfd_only=cfg.cfd_only)
             log.info('PAPER_PERFORMANCE %s',json.dumps(report,ensure_ascii=False,allow_nan=False))
             self._last_performance_marker=marker
         return state
@@ -341,9 +358,15 @@ class TradingEngine:
                 self._reconciliation_tasks[current['id']]=asyncio.create_task(self._reconcile_background(quote,identity,generation))
     async def tick(self):
         cfg=self.settings(); positions=self.store.positions()
+        self._enforce_market_scope(cfg)
         held_symbols={p['symbol'] for p in positions}
-        symbols=list(dict.fromkeys([p['symbol'] for p in positions]+cfg.symbols+['BTCUSDT']))
+        symbols=list(dict.fromkeys([p['symbol'] for p in positions]+([] if cfg.cfd_only else cfg.symbols+['BTCUSDT'])))
         try:
+            if cfg.cfd_only:
+                if any(not p['symbol'].startswith('CAP:') or p.get('kind')!='cfd' for p in positions):
+                    raise MarketError('Position hors périmètre CFD : nouvelles analyses suspendues.')
+                if not getattr(getattr(self.market,'capital',None),'configured',False):
+                    raise MarketError('Compte de cotations Capital.com démo non connecté.')
             now=await self.market.server_time()
             if abs(now-int(time.time()*1000))>5000: raise MarketError('Horloge ordinateur décalée de plus de 5 secondes : synchronisez-la.')
             captured={p['symbol']:p for p in positions}
@@ -398,7 +421,7 @@ class TradingEngine:
             required=list(held_symbols) if cfd_available else symbols
             if not all(s in self.quotes and 0<=now-self.quotes[s].time_ms<=15000 for s in required): raise MarketError('Cotations périmées.')
             self.health.update(market_ok=True,last_quote_at=utcnow())
-            if not self.store.get('btc_baseline') and 'BTCUSDT' in self.quotes:
+            if not cfg.cfd_only and not self.store.get('btc_baseline') and 'BTCUSDT' in self.quotes:
                 entry=self.quotes['BTCUSDT'].ask*(1+cfg.slippage_bps/10000)
                 self.store.set('btc_baseline',{'quantity':self.store.get('initial_capital')/(entry*(1+cfg.fee_rate)),
                     'fee_rate':cfg.fee_rate,'slippage_bps':cfg.slippage_bps})
@@ -552,6 +575,7 @@ class TradingEngine:
         return selected
     async def _analyze(self):
         cfg=self.settings(); revision=self._settings_revision
+        self._enforce_market_scope(cfg)
         held=self.store.positions()
         if not self.health['market_ok'] and not held: return
         now=await self.market.server_time()
@@ -562,6 +586,8 @@ class TradingEngine:
         expanded=cfg.auto_scanner or cfg.cfd_enabled
         slots={'crypto':asyncio.Semaphore(2),'cfd':asyncio.Semaphore(2)}
         async def market_context(symbol):
+            if cfg.cfd_only and not symbol.startswith('CAP:'):
+                raise MarketError('Cryptomonnaies désactivées : marchés CFD uniquement.')
             async with slots['cfd' if symbol.startswith('CAP:') else 'crypto']:
                 quote=await self.market.quote(symbol)
                 previous=self.quotes.get(symbol)
@@ -612,19 +638,21 @@ class TradingEngine:
                 return symbol,data,list(dict.fromkeys(setups+shorts))
         rows=[]
         try:
-            if cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
+            if not cfg.cfd_only and cfg.auto_scanner and (not self._universe or time.monotonic()-self._universe_at>900 or len(self._universe)!=cfg.scanner_limit):
                 try:
                     self._universe=await self.market.liquid_symbols(cfg.scanner_limit)
                     self._universe_at=time.monotonic()
                 except MarketError:
                     if not cfg.cfd_enabled: raise
                     self._universe=[]
-            crypto=self._universe if cfg.auto_scanner else cfg.symbols
+            crypto=[] if cfg.cfd_only else self._universe if cfg.auto_scanner else cfg.symbols
             cfd=await self.market.cfd_symbols(cfg.cfd_scan_limit) if cfg.cfd_enabled and hasattr(self.market,'cfd_symbols') else []
+            if cfg.cfd_only:cfd=[symbol for symbol in cfd if symbol.startswith('CAP:')]
             held_symbols={p['symbol'] for p in held}
-            symbols=list(dict.fromkeys([p['symbol'] for p in held]+crypto+cfd))
+            symbols=list(dict.fromkeys([p['symbol'] for p in held if not cfg.cfd_only or p['symbol'].startswith('CAP:')]+crypto+cfd))
             tasks={symbol:asyncio.create_task(market_context(symbol)) for symbol in symbols}
             try:
+                if not tasks:raise MarketError('Aucun marché CFD disponible : vérifiez la connexion démo et les horaires de marché.')
                 if expanded:
                     remaining=max(0.,min(30.,(expected+43000-await self.market.server_time())/1000))
                     done,pending=await asyncio.wait(list(tasks.values()),timeout=remaining)
@@ -802,6 +830,8 @@ class TradingEngine:
         fetched_rules={};q=None;io_rejection=None
         try:
             if result.error:raise RiskRejected(result.error)
+            if entry and (cfg.cfd_only or getattr(self.env,'cfd_only',False)) and not str(decision.symbol).startswith('CAP:'):
+                raise RiskRejected('Cryptomonnaies désactivées : marchés CFD uniquement.')
             validate_context(decision,context)
             if entry and int(time.time()*1000)-expected>65000:
                 raise RiskRejected('Décision IA trop tardive après clôture M5 (>65 s).')
@@ -830,6 +860,8 @@ class TradingEngine:
             # positions cannot wait for broker or history requests.
             try:
                 if io_rejection:raise RiskRejected(io_rejection)
+                if entry and (cfg.cfd_only or getattr(self.env,'cfd_only',False)) and not str(decision.symbol).startswith('CAP:'):
+                    raise RiskRejected('Cryptomonnaies désactivées : marchés CFD uniquement.')
                 validate_context(decision,context)
                 if self.critical_error:raise RiskRejected('Moteur suspendu : décision annulée.')
                 if expected<self.started_ms:raise RiskRejected('Cycle antérieur au dernier démarrage : décision annulée.')

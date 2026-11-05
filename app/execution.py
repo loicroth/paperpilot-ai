@@ -44,6 +44,8 @@ class PaperExecutionEngine:
         except (KeyError,TypeError,ValueError,AttributeError):
             log.warning('PAPER_TRADE_AUDIT unavailable for a recorded trade')
     def buy(self,plan,quote,signal,decision,settings,detail):
+        if getattr(settings,'cfd_only',False) and (getattr(plan,'kind','spot')!='cfd' or not str(plan.symbol).startswith('CAP:')):
+            raise ValueError('Cryptomonnaies désactivées : marchés CFD uniquement.')
         if getattr(plan,'kind','spot')=='cfd':
             return self._cfd_open(plan,quote,signal,decision,settings,detail)
         if quote.symbol!=plan.symbol: raise ValueError('Marché de cotation différent du plan.')
