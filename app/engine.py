@@ -131,7 +131,7 @@ class TradingEngine:
         if hasattr(self.ai,'close'): await self.ai.close()
     def error(self,message):
         self.critical_error=message
-        self.health.update(status='ERREUR',message=message,market_ok=False,ai_ok=False)
+        self.health.update(status='ERREUR',message=message,market_ok=False)
         try: self.store.set('mode','paused')
         except Exception: log.error('Impossible de persister la pause ; blocage conservé en mémoire.')
         if message!=self.last_error:
@@ -433,7 +433,7 @@ class TradingEngine:
                 self.last_snapshot=time.monotonic()
             mode=self.store.get('mode')
             if self.critical_error:
-                self.health.update(status='ERREUR',message=self.critical_error,ai_ok=False)
+                self.health.update(status='ERREUR',message=self.critical_error)
             elif not self.env.api_key and not getattr(self.ai,'test_enabled',False):
                 self.health.update(status='PAUSE',message='IA non configurée : ajoutez OPENAI_API_KEY dans .env et redémarrez.',ai_ok=False)
             elif ds['blocked']:
@@ -466,7 +466,6 @@ class TradingEngine:
             message=f'Analyse annulée : {type(exc).__name__}: {str(exc)[:400]}'
             try: self.error(message)
             except Exception: log.exception('Erreur critique : base indisponible ; entrées bloquées en mémoire.')
-            self.health['ai_error']=message
     async def _prepare_entry_candidates(self,ranked,rows,cfg,expected,expanded):
         """Check every technical candidate before spending the bounded AI slots.
 
@@ -717,6 +716,12 @@ class TradingEngine:
         if bounds:log.info('PAPER_FEASIBILITY_AUDIT %s',json.dumps({'at':utcnow(),'markets':bounds},ensure_ascii=False,allow_nan=False))
         stats,_=statistics(self.store,self.quotes);day=self.day_state(stats['equity'])
         positions=[{k:v for k,v in p.items() if k!='detail'} for p in stats['positions']]
+        if managed:
+            # Quote protection can close a holding while the scan awaits I/O.
+            # Never bind that old management job to an empty or replacement row.
+            current=next((p for p in positions if p['symbol']==managed['symbol']),None)
+            if not current or self._position_identity(current)!=self._position_identity(managed):
+                managed=None
         used=portfolio_remaining_risk(self.store.positions(),self.quotes,now_ms=int(time.time()*1000))
         import math
         risk_known=math.isfinite(used)
@@ -793,8 +798,14 @@ class TradingEngine:
             opening=self.store.position(context['managed_symbol'])
             # The position captured in context remains the identity fence below.
             # A missing/replaced row must never be converted into an AI request.
-            captured=next((p for p in context.get('positions',[]) if p.get('symbol')==context['managed_symbol']),{})
-            decision,local_audit=management_decision(opening or captured,
+            captured=next((p for p in context.get('positions',[]) if p.get('symbol')==context['managed_symbol']),None)
+            if not opening or not captured or self._position_identity(opening)!=self._position_identity(captured):
+                reason='Gestion ignorée : position clôturée ou remplacée pendant l’analyse.'
+                self.store.decision(wait(reason),None,{'managed_symbol':context['managed_symbol'],
+                    'closed_candle_ms':expected,'decision_source':'local_closed_h1_v2'})
+                self.health['last_analysis_at']=self.store.get('last_analysis_at')
+                return {'error':None,'error_kind':None,'local':True,'api_called':False}
+            decision,local_audit=management_decision(opening,
                 raw_markets.get(context['managed_symbol'],{}),now_ms=int(time.time()*1000))
             result=AIResult(decision)
         elif not self.env.api_key and not getattr(self.ai,'test_enabled',False):

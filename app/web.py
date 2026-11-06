@@ -147,7 +147,8 @@ def create_app(env=None,store=None,engine=None,background=True):
             if action=='start':
                 bot.critical_error=None
                 bot.started_ms=int(__import__('time').time()*1000)
-                bot.health['ai_error']=None
+                # A local engine restart cannot verify API access or clear an
+                # authentication/quota failure. Keep the last known AI state.
             db.set('mode',modes[action])
             db.event({'start':'Simulation démarrée. Seules les futures clôtures M5 sont analysées.',
                 'pause':'Nouvelles entrées en pause ; protection et sorties IA conservées.',

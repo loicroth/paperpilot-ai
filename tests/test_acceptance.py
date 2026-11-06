@@ -156,8 +156,10 @@ def test_btc_hold_comparison_applies_same_entry_and_exit_cost_conventions(db):
 
 
 @pytest.mark.asyncio
-async def test_critical_analysis_error_stays_fail_closed_even_when_error_journal_fails(rig,monkeypatch):
+@pytest.mark.parametrize('ai_verified',[False,True])
+async def test_critical_analysis_error_stays_fail_closed_even_when_error_journal_fails(rig,monkeypatch,ai_verified):
     engine,store,market,ai,_=rig
+    engine.health.update(ai_ok=ai_verified,ai_error=None,ai_error_kind=None)
     async def fail_analysis():
         raise sqlite3.OperationalError('Fixture critical read failure')
     def fail_journal(*args,**kwargs):
@@ -167,12 +169,16 @@ async def test_critical_analysis_error_stays_fail_closed_even_when_error_journal
     await engine.analyze()  # Error reporting itself must not escape as an unhandled task exception.
     assert engine.critical_error and 'OperationalError' in engine.critical_error
     assert engine.health['status']=='ERREUR'
-    assert engine.health['ai_ok'] is False and engine.health['market_ok'] is False
+    assert engine.health['market_ok'] is False
+    assert engine.health['ai_ok'] is ai_verified
+    assert engine.health.get('ai_error') is None
     assert store.get('mode')=='paused'
     assert store.position() is None and store.get('cash')==900
     assert not ai.contexts
     engine.last_analysis_poll=0
     await engine.tick()
     assert engine.health['status']=='ERREUR'
+    assert engine.health['ai_ok'] is ai_verified
     assert engine.analysis_task is None
     assert not ai.contexts and store.position() is None
+
